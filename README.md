@@ -61,6 +61,22 @@ No Windows com DLL T2U 32-bit:
 py -3-32 server.py --host 127.0.0.1 --port 8088
 ```
 
+## Autenticacao
+
+A interface web usa autenticacao HTTP Basic. Na primeira execucao, se nenhuma senha estiver configurada, o acesso padrao e:
+
+```text
+Usuario: admin
+Senha: deixe em branco
+```
+
+Depois de acessar, altere em `Gravacao > Acesso`:
+
+- `Usuario`: nome usado para entrar na pagina.
+- `Nova senha`: nova senha da interface web, com limite de 50 caracteres.
+
+A senha nao e gravada em texto plano. Quando a configuracao e salva, o app armazena um hash PBKDF2-SHA256 em `data/config.json`. Se uma senha curta for colocada manualmente nesse arquivo, ela sera convertida automaticamente para hash na proxima carga da configuracao.
+
 ## Cloud/P2P no Windows
 
 Na tela `T2U Clouds`, configure:
