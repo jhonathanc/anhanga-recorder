@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/config.json
+data/*.log
+recordings/*
+!recordings/.gitkeep

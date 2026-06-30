@@ -1,0 +1,70 @@
+{
+  "settings": {
+    "outputDir": "./recordings",
+    "segmentSeconds": 900,
+    "rtspTransport": "tcp",
+    "ffmpegPath": "ffmpeg",
+    "ffprobePath": "ffprobe",
+    "mapMode": "av",
+    "autoRestart": true,
+    "restartDelaySeconds": 10,
+    "alignSegmentsToClock": true,
+    "maxLogLines": 400,
+    "webUser": "admin",
+    "webPassword": "",
+    "t2uDllPath": "../Libt2u Win32 SDK/libt2u.dll",
+    "t2uServer": "",
+    "t2uServerPort": 0,
+    "t2uServerKey": "",
+    "t2uDevicePassword": "",
+    "t2uConnectTimeoutSeconds": 30
+  },
+  "t2uClouds": [
+    {
+      "id": "t2u-default",
+      "name": "T2U Cloud",
+      "t2uDllPath": "../Libt2u Win32 SDK/libt2u.dll",
+      "t2uServer": "",
+      "t2uServerPort": 0,
+      "t2uServerKey": "",
+      "t2uDevicePassword": "",
+      "t2uConnectTimeoutSeconds": 30
+    }
+  ],
+  "sourceGroups": [
+    {
+      "id": "dvr-loja",
+      "name": "DVR Loja",
+      "t2uCloudId": "t2u-default",
+      "p2pUuid": "ID_P2P_DO_DISPOSITIVO",
+      "p2pPassword": "",
+      "p2pRemoteIp": "127.0.0.1",
+      "p2pRemotePort": 554,
+      "p2pLocalPort": 0,
+      "rtspUser": "USUARIO_RTSP",
+      "rtspPassword": "",
+      "maxSources": 0,
+      "enabled": true
+    }
+  ],
+  "cameras": [
+    {
+      "id": "canal-1",
+      "name": "Canal 1",
+      "type": "cloud-p2p",
+      "groupId": "dvr-loja",
+      "rtspPath": "/cam/realmonitor?channel=1&subtype=0",
+      "stream": "main",
+      "enabled": true
+    },
+    {
+      "id": "stream-1",
+      "name": "Stream direto",
+      "type": "stream",
+      "url": "rtsp://USUARIO:SENHA@192.0.2.10:554/cam/realmonitor?channel=1&subtype=0",
+      "stream": "main",
+      "group": "Rede local",
+      "enabled": false
+    }
+  ]
+}

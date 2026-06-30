@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Anhangá Recorder</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Anhangá Recorder</h1>
+        <p id="systemLine">Carregando...</p>
+      </div>
+      <div class="top-actions">
+        <button id="startSelected" class="primary">Gravar selecionadas</button>
+        <button id="startAll">Gravar todas</button>
+        <button id="stopSelected">Parar selecionadas</button>
+        <button id="stopAll" class="danger">Parar todas</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="sources">
+        <div class="section-heading">
+          <h2>Fontes</h2>
+          <button id="newSource">Nova fonte</button>
+        </div>
+        <div id="sourceList" class="source-list"></div>
+        <div id="previewSection" class="live-preview" hidden>
+          <div class="section-heading">
+            <h2>Ao vivo</h2>
+            <span id="previewCount" class="meta"></span>
+          </div>
+          <div id="previewGrid" class="preview-grid"></div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="panel">
+          <h2>T2U Clouds</h2>
+          <label>
+            Cloud
+            <select id="t2uCloudSelect"></select>
+          </label>
+          <form id="t2uCloudForm">
+            <input type="hidden" id="t2uCloudId">
+            <label>
+              Nome
+              <input id="t2uCloudName" autocomplete="off" placeholder="T2U Cloud">
+            </label>
+            <label>
+              DLL T2U
+              <input id="t2uDllPath" autocomplete="off" placeholder="../Libt2u Win32 SDK/libt2u.dll">
+            </label>
+            <div class="two-col">
+              <label>
+                Servidor
+                <input id="t2uServer" autocomplete="off" placeholder="servidor T2U">
+              </label>
+              <label>
+                Porta
+                <input id="t2uServerPort" type="number" min="0" max="65535" value="0">
+              </label>
+            </div>
+            <label>
+              Chave do servidor
+              <input id="t2uServerKey" type="password" autocomplete="off">
+            </label>
+            <label>
+              Senha T2U/P2P padrao
+              <input id="t2uDevicePassword" type="password" autocomplete="off">
+            </label>
+            <label>
+              Timeout T2U
+              <input id="t2uConnectTimeoutSeconds" type="number" min="3" max="180" value="30">
+            </label>
+            <div class="form-actions">
+              <button type="submit" class="primary">Salvar cloud</button>
+              <button type="button" id="newT2uCloud">Nova cloud</button>
+              <button type="button" id="deleteT2uCloud" class="danger" hidden>Remover</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel">
+          <h2>Grupos Cloud/P2P</h2>
+          <label>
+            Grupo
+            <select id="sourceGroupSelect"></select>
+          </label>
+          <form id="sourceGroupForm">
+            <input type="hidden" id="sourceGroupId">
+            <label>
+              Nome
+              <input id="sourceGroupName" autocomplete="off" placeholder="DVR Loja, Predio, Portaria">
+            </label>
+            <label>
+              T2U Cloud
+              <select id="sourceGroupCloudId"></select>
+            </label>
+            <label>
+              Máximo de fontes permitidas
+              <input id="sourceGroupMaxSources" type="number" min="0" max="128" value="0">
+            </label>
+            <div class="two-col">
+              <label>
+                ID do dispositivo P2P
+                <input id="sourceGroupP2pUuid" autocomplete="off" placeholder="Serial, UID ou UUID do dispositivo">
+              </label>
+              <label>
+                Porta remota
+                <input id="sourceGroupP2pRemotePort" type="number" min="1" max="65535" value="554">
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                IP remoto
+                <input id="sourceGroupP2pRemoteIp" autocomplete="off" value="127.0.0.1">
+              </label>
+              <label>
+                Porta local
+                <input id="sourceGroupP2pLocalPort" type="number" min="0" max="65535" value="0">
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                Usuario RTSP
+                <input id="sourceGroupRtspUser" autocomplete="off" placeholder="admin">
+              </label>
+              <label>
+                Senha RTSP
+                <input id="sourceGroupRtspPassword" type="password" autocomplete="off">
+              </label>
+            </div>
+            <label>
+              Senha T2U/P2P
+              <input id="sourceGroupP2pPassword" type="password" autocomplete="off" placeholder="Usar senha padrao da cloud">
+            </label>
+            <label class="check">
+              <input id="sourceGroupEnabled" type="checkbox" checked>
+              Habilitado
+            </label>
+            <div class="form-actions">
+              <button type="submit" class="primary">Salvar grupo</button>
+              <button type="button" id="newSourceGroup">Novo grupo</button>
+              <button type="button" id="deleteSourceGroup" class="danger" hidden>Remover</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel">
+          <h2 id="formTitle">Nova fonte</h2>
+          <form id="sourceForm">
+            <input type="hidden" id="sourceId">
+            <label>
+              Nome
+              <input id="name" required autocomplete="off" placeholder="Portao, Recepcao, Canal 1">
+            </label>
+            <label>
+              Tipo
+              <select id="type">
+                <option value="stream">Stream de rede</option>
+                <option value="cloud-p2p">Cloud/P2P Windows</option>
+                <option value="v4l2">Dispositivo Linux</option>
+              </select>
+            </label>
+            <div id="streamFields">
+              <label>
+                URL
+                <input id="url" autocomplete="off" placeholder="rtsp://usuario:senha@host:554/...">
+              </label>
+              <label>
+                Stream
+                <select id="stream">
+                  <option value="main">Principal</option>
+                  <option value="extra">Extra</option>
+                  <option value="custom">Personalizado</option>
+                </select>
+              </label>
+            </div>
+            <div id="cloudFields" hidden>
+              <label>
+                Grupo Cloud/P2P
+                <select id="cloudGroupId"></select>
+              </label>
+              <label>
+                Caminho RTSP
+                <input id="rtspPath" autocomplete="off" value="/cam/realmonitor?channel=1&subtype=0">
+              </label>
+            </div>
+            <div id="deviceFields" hidden>
+              <label>
+                Video
+                <input id="videoDevice" autocomplete="off" placeholder="/dev/video0">
+              </label>
+              <label>
+                Audio
+                <input id="audioDevice" autocomplete="off" placeholder="default ou hw:0">
+              </label>
+              <div class="two-col">
+                <label>
+                  Resolucao
+                  <input id="resolution" autocomplete="off" placeholder="1920x1080">
+                </label>
+                <label>
+                  FPS
+                  <input id="frameRate" autocomplete="off" placeholder="30">
+                </label>
+              </div>
+              <label>
+                Formato
+                <input id="inputFormat" autocomplete="off" placeholder="mjpeg, yuyv422">
+              </label>
+            </div>
+            <label id="groupTagField">
+              Grupo/Tag
+              <input id="group" autocomplete="off" placeholder="DVR, Loja, Predio">
+            </label>
+            <label class="check">
+              <input id="enabled" type="checkbox" checked>
+              Habilitada
+            </label>
+            <div class="form-actions">
+              <button type="submit" class="primary">Salvar fonte</button>
+              <button type="button" id="probeSource">Testar</button>
+              <button type="button" id="deleteSource" class="danger" hidden>Remover</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel">
+          <h2>URL RTSP</h2>
+          <div class="two-col">
+            <label>
+              Host
+              <input id="tplHost" autocomplete="off" placeholder="192.168.1.108">
+            </label>
+            <label>
+              Porta
+              <input id="tplPort" autocomplete="off" value="554">
+            </label>
+          </div>
+          <div class="two-col">
+            <label>
+              Usuario
+              <input id="tplUser" autocomplete="off" placeholder="admin">
+            </label>
+            <label>
+              Senha
+              <input id="tplPass" type="password" autocomplete="off">
+            </label>
+          </div>
+          <div class="two-col">
+            <label>
+              Canal
+              <input id="tplChannel" type="number" min="1" value="1">
+            </label>
+            <label>
+              Qualidade
+              <select id="tplSubtype">
+                <option value="0">Principal</option>
+                <option value="1">Extra</option>
+              </select>
+            </label>
+          </div>
+          <button id="buildRtsp">Preencher URL</button>
+        </section>
+
+        <section class="panel">
+          <h2>Gravacao</h2>
+          <label>
+            Pasta de destino
+            <input id="outputDir" autocomplete="off">
+          </label>
+          <div class="two-col">
+            <label>
+              Segmento
+              <select id="segmentSeconds">
+                <option value="300">5 min</option>
+                <option value="900">15 min</option>
+                <option value="1800">30 min</option>
+                <option value="3600">1 h</option>
+              </select>
+            </label>
+            <label>
+              RTSP
+              <select id="rtspTransport">
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="auto">Auto</option>
+              </select>
+            </label>
+          </div>
+          <label>
+            Fluxos
+            <select id="mapMode">
+              <option value="av">Video e audio</option>
+              <option value="all">Todos</option>
+            </select>
+          </label>
+          <label class="check">
+            <input id="autoRestart" type="checkbox">
+            Reiniciar stream se cair
+          </label>
+          <label class="check">
+            <input id="alignSegmentsToClock" type="checkbox">
+            Alinhar segmentos ao relogio
+          </label>
+          <h2>Acesso</h2>
+          <div class="two-col">
+            <label>
+              Usuario
+              <input id="webUser" autocomplete="off" placeholder="admin">
+            </label>
+            <label>
+              Nova senha
+              <input id="webPassword" type="password" autocomplete="off" maxlength="50">
+            </label>
+          </div>
+          <button id="saveSettings" class="primary">Salvar gravacao</button>
+        </section>
+      </aside>
+    </main>
+
+    <section class="bottom">
+      <div class="panel recordings">
+        <div class="section-heading">
+          <h2>Arquivos</h2>
+          <button id="refreshRecordings">Atualizar</button>
+        </div>
+        <div id="recordingsList" class="recording-list"></div>
+      </div>
+      <div class="panel logs">
+        <div class="section-heading">
+          <h2>Logs</h2>
+          <button id="clearViewLog">Limpar tela</button>
+        </div>
+        <pre id="logBox"></pre>
+      </div>
+    </section>
+
+    <dialog id="probeDialog">
+      <form method="dialog">
+        <h2>Teste da fonte</h2>
+        <pre id="probeResult"></pre>
+        <button>Fechar</button>
+      </form>
+    </dialog>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

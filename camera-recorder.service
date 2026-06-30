@@ -1,0 +1,15 @@
+[Unit]
+Description=Anhangá Recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/anhanga-recorder
+ExecStart=/usr/bin/python3 /opt/anhanga-recorder/server.py --host 127.0.0.1 --port 8088
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
