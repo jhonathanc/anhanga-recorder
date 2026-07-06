@@ -12,7 +12,7 @@
     "maxLogLines": 400,
     "webUser": "admin",
     "webPassword": "",
-    "t2uDllPath": "../Libt2u Win32 SDK/libt2u.dll",
+    "t2uDllPath": "./native/libt2u.so",
     "t2uServer": "",
     "t2uServerPort": 0,
     "t2uServerKey": "",
@@ -23,7 +23,7 @@
     {
       "id": "t2u-default",
       "name": "T2U Cloud",
-      "t2uDllPath": "../Libt2u Win32 SDK/libt2u.dll",
+      "t2uDllPath": "./native/libt2u.so",
       "t2uServer": "",
       "t2uServerPort": 0,
       "t2uServerKey": "",
