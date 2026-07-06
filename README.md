@@ -1,6 +1,6 @@
 # Anhangá Recorder
 
-Aplicacao local acessada pelo navegador para gravar em disco cameras ou entradas selecionadas. O caminho mais portavel e confiavel continua sendo FFmpeg diretamente nos streams RTSP. No Windows, tambem ha um modo experimental `Cloud/P2P Windows` usando `libt2u.dll` para abrir um tunel local antes de chamar o FFmpeg.
+Aplicacao local acessada pelo navegador para gravar em disco cameras ou entradas selecionadas. O caminho mais portavel e confiavel continua sendo FFmpeg diretamente nos streams RTSP. Tambem ha um modo experimental `Cloud/P2P` usando uma biblioteca T2U para abrir um tunel local antes de chamar o FFmpeg.
 
 ## O que ela faz
 
@@ -12,7 +12,7 @@ Aplicacao local acessada pelo navegador para gravar em disco cameras ou entradas
 - Inclui um gerador de URL RTSP no formato comum:
   `rtsp://usuario:senha@host:554/cam/realmonitor?channel=1&subtype=0`
 - Tambem aceita dispositivos locais Linux via V4L2, como `/dev/video0`, e audio ALSA opcional.
-- No Windows, pode testar Cloud/P2P via T2U mapeando uma porta remota do dispositivo para `127.0.0.1`.
+- Pode testar Cloud/P2P via T2U mapeando uma porta remota do dispositivo para `127.0.0.1`.
 
 ## Requisitos
 
@@ -20,7 +20,14 @@ No Linux:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 ffmpeg
+sudo apt install -y python3 ffmpeg build-essential
+```
+
+Para compilar a biblioteca T2U Linux local:
+
+```bash
+cd native/libt2u_linux
+make
 ```
 
 No Windows para Cloud/P2P:
@@ -29,9 +36,11 @@ No Windows para Cloud/P2P:
 - SDK T2U com `libt2u.dll` na pasta do projeto ou o caminho da DLL configurado na tela.
 - Se a DLL for `x86 / PE32`, use Python 32-bit. Se tiver uma DLL x64, use Python 64-bit.
 
-## Biblioteca de terceiros
+## Biblioteca T2U
 
-O modo `Cloud/P2P Windows` depende de uma biblioteca de terceiros (`libt2u.dll`). Essa biblioteca nao faz parte deste projeto, nao e redistribuida neste repositorio e deve ser obtida separadamente pelo usuario, respeitando a licenca e os termos do fornecedor da SDK.
+O modo `Cloud/P2P` usa a ABI T2U (`libt2u`). No Linux, este repositorio inclui uma biblioteca de compatibilidade em `native/libt2u_linux`, com tunel TCP direto funcional quando o endereco remoto e alcancavel pela rede e suporte experimental P2P/NAT reconstruido a partir da biblioteca Android. A interoperabilidade P2P ainda precisa ser validada com o servidor T2U e cameras reais do ambiente autorizado.
+
+No Windows, o modo depende de uma biblioteca de terceiros (`libt2u.dll`). Essa biblioteca nao faz parte deste projeto, nao e redistribuida neste repositorio e deve ser obtida separadamente pelo usuario, respeitando a licenca e os termos do fornecedor da SDK.
 
 Download oficial da SDK T2U/P2P:
 
@@ -77,11 +86,11 @@ Depois de acessar, altere em `Gravacao > Acesso`:
 
 A senha nao e gravada em texto plano. Quando a configuracao e salva, o app armazena um hash PBKDF2-SHA256 em `data/config.json`. Se uma senha curta for colocada manualmente nesse arquivo, ela sera convertida automaticamente para hash na proxima carga da configuracao.
 
-## Cloud/P2P no Windows
+## Cloud/P2P
 
 Na tela `T2U Clouds`, configure:
 
-- `DLL T2U`: caminho da `libt2u.dll`.
+- `Biblioteca T2U`: caminho da `libt2u.so` no Linux ou da `libt2u.dll` no Windows.
 - `Servidor`, `Porta`, `Chave do servidor` e `Senha T2U/P2P padrao`: valores do ambiente T2U que voce esta autorizado a usar.
 - `Timeout T2U`: tempo maximo para conectar ao servidor e abrir o tunel.
 
@@ -95,7 +104,7 @@ Depois, em `Grupos Cloud/P2P`, configure os dados comuns ao dispositivo:
 - `Porta local`: `0` deixa a SDK escolher uma porta livre.
 - `Usuario RTSP` e `Senha RTSP`.
 
-Ao cadastrar uma fonte `Cloud/P2P Windows`, selecione o grupo e informe apenas o `Caminho RTSP`, por exemplo:
+Ao cadastrar uma fonte `Cloud/P2P`, selecione o grupo e informe apenas o `Caminho RTSP`, por exemplo:
 
 ```text
 /cam/realmonitor?channel=1&subtype=0
@@ -103,7 +112,7 @@ Ao cadastrar uma fonte `Cloud/P2P Windows`, selecione o grupo e informe apenas o
 
 O app abre o tunel com `t2u_add_port_v3(...)`, aguarda `t2u_port_status(...) > 0`, monta uma URL como `rtsp://usuario:senha@127.0.0.1:<porta-local>/...` e passa essa URL para o FFmpeg. Ao parar a gravacao, chama `t2u_del_port(...)`.
 
-Esse ID P2P e usado somente no modo `Cloud/P2P Windows`. Para conexoes RTSP diretas, use a URL/IP, porta, usuario e senha da fonte.
+Esse ID P2P e usado somente no modo `Cloud/P2P`. Para conexoes RTSP diretas, use a URL/IP, porta, usuario e senha da fonte.
 
 ## Qualidade maxima
 

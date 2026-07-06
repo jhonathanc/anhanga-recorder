@@ -29,7 +29,7 @@ APP_NAME = "Anhangá Recorder"
 DATA_DIR = Path(os.environ.get("CAMERA_RECORDER_DATA_DIR", APP_DIR / "data")).resolve()
 CONFIG_PATH = DATA_DIR / "config.json"
 VERSION = "0.3.0"
-DEFAULT_T2U_DLL = "../Libt2u Win32 SDK/libt2u.dll"
+DEFAULT_T2U_DLL = "../Libt2u Win32 SDK/libt2u.dll" if os.name == "nt" else "./native/libt2u.so"
 T2U_SETTING_KEYS = (
     "t2uDllPath",
     "t2uServer",
@@ -189,7 +189,7 @@ def redact_url(text):
 
 
 def pe_machine(path):
-    result = {"machine": None, "label": None, "bits": None}
+    result = {"format": None, "machine": None, "label": None, "bits": None}
     try:
         data = Path(path).read_bytes()[:512]
         if len(data) < 0x40 or data[:2] != b"MZ":
@@ -209,7 +209,40 @@ def pe_machine(path):
         0xAA64: ("ARM64", 64),
     }
     label, bits = labels.get(machine, (f"0x{machine:04X}", None))
-    return {"machine": machine, "label": label, "bits": bits}
+    return {"format": "PE", "machine": machine, "label": label, "bits": bits}
+
+
+def elf_machine(path):
+    result = {"format": None, "machine": None, "label": None, "bits": None}
+    try:
+        data = Path(path).read_bytes()[:64]
+    except OSError:
+        return result
+    if len(data) < 20 or data[:4] != b"\x7fELF":
+        return result
+
+    bits = 64 if data[4] == 2 else 32 if data[4] == 1 else None
+    byteorder = "big" if data[5] == 2 else "little"
+    machine = int.from_bytes(data[18:20], byteorder)
+    labels = {
+        0x03: ("x86 / ELF32", 32),
+        0x08: (f"MIPS / ELF{bits or ''}", bits),
+        0x28: ("ARM / ELF32", 32),
+        0x3E: ("x86_64 / ELF64", 64),
+        0xB7: ("AArch64 / ELF64", 64),
+    }
+    label, expected_bits = labels.get(machine, (f"ELF machine 0x{machine:04X}", bits))
+    return {"format": "ELF", "machine": machine, "label": label, "bits": expected_bits}
+
+
+def shared_library_machine(path):
+    pe = pe_machine(path)
+    if pe.get("format"):
+        return pe
+    elf = elf_machine(path)
+    if elf.get("format"):
+        return elf
+    return {"format": None, "machine": None, "label": None, "bits": None}
 
 
 def python_bits():
@@ -762,20 +795,27 @@ class T2uRuntime:
         configured = settings.get("t2uDllPath") or DEFAULT_T2U_DLL
         path = resolve_app_path(configured)
         exists = bool(path and path.exists())
-        machine = pe_machine(path) if exists else {"label": None, "bits": None}
+        machine = shared_library_machine(path) if exists else {"format": None, "label": None, "bits": None}
         py_bits = python_bits()
-        loadable = os.name == "nt" and exists and (machine.get("bits") in (None, py_bits))
+        loadable = exists and (machine.get("bits") in (None, py_bits))
+        if os.name == "nt" and machine.get("format") == "ELF":
+            loadable = False
+        if os.name != "nt" and machine.get("format") == "PE":
+            loadable = False
         message = "T2U pronto para carregar" if loadable else "T2U indisponivel"
-        if os.name != "nt":
-            message = "SDK T2U Win32 so carrega no Windows"
-        elif not exists:
-            message = "DLL T2U nao encontrada"
+        if not exists:
+            message = "Biblioteca T2U nao encontrada"
+        elif os.name == "nt" and machine.get("format") == "ELF":
+            message = "Use DLL T2U no Windows; ELF .so e para Linux"
+        elif os.name != "nt" and machine.get("format") == "PE":
+            message = "Use libt2u.so Linux; DLL Windows nao carrega no Linux"
         elif machine.get("bits") and machine.get("bits") != py_bits:
-            message = f"DLL {machine.get('bits')}-bit exige Python {machine.get('bits')}-bit"
+            message = f"Biblioteca {machine.get('bits')}-bit exige Python {machine.get('bits')}-bit"
         return {
             "configured": configured,
             "path": str(path) if path else "",
             "found": exists,
+            "format": machine.get("format"),
             "machine": machine.get("label"),
             "pythonBits": py_bits,
             "loadable": loadable,
@@ -784,16 +824,18 @@ class T2uRuntime:
         }
 
     def _load(self, settings):
-        if os.name != "nt":
-            raise RuntimeError("A SDK T2U Win32 so pode ser carregada no Windows.")
         path = resolve_app_path(settings.get("t2uDllPath") or DEFAULT_T2U_DLL)
         if not path or not path.exists():
-            raise RuntimeError(f"DLL T2U nao encontrada: {path}")
-        machine = pe_machine(path)
+            raise RuntimeError(f"Biblioteca T2U nao encontrada: {path}")
+        machine = shared_library_machine(path)
+        if os.name == "nt" and machine.get("format") == "ELF":
+            raise RuntimeError("Use uma DLL T2U no Windows; o arquivo configurado e ELF/Linux.")
+        if os.name != "nt" and machine.get("format") == "PE":
+            raise RuntimeError("Use uma libt2u.so Linux; DLL Windows nao carrega no Linux.")
         if machine.get("bits") and machine["bits"] != python_bits():
             raise RuntimeError(
                 f"{path.name} e {machine['bits']}-bit, mas este Python e {python_bits()}-bit. "
-                f"Use Python {machine['bits']}-bit ou uma DLL T2U {python_bits()}-bit."
+                f"Use Python {machine['bits']}-bit ou uma biblioteca T2U {python_bits()}-bit."
             )
         if self._dll is not None and self._dll_path == str(path):
             return self._dll
