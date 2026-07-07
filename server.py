@@ -1044,9 +1044,24 @@ class T2uTunnelPool:
             str(settings.get("t2uServerKey") or ""),
         )
 
-    def acquire(self, camera, settings):
-        key = self.key_for(camera, settings)
+    def _active_count_for_group_locked(self, group_id):
+        return sum(shared.refs for key, shared in self._items.items() if key[0] == group_id and not shared.tunnel.closed)
+
+    def active_count_for_group(self, group_id):
         with self._lock:
+            return self._active_count_for_group_locked(str(group_id or ""))
+
+    def acquire(self, camera, settings, group=None):
+        key = self.key_for(camera, settings)
+        group_id = str((group or {}).get("id") or camera.get("groupId") or camera.get("id") or "")
+        group_name = str((group or {}).get("name") or group_id or "Cloud/P2P")
+        group_limit = int((group or {}).get("maxSources") or 0)
+        with self._lock:
+            if group_limit > 0:
+                active = self._active_count_for_group_locked(group_id)
+                if active >= group_limit:
+                    raise RuntimeError(f"Limite do grupo {group_name} atingido ({active}/{group_limit}).")
+
             shared = self._items.get(key)
             if shared and not shared.tunnel.closed:
                 shared.refs += 1
@@ -1095,11 +1110,11 @@ def cloud_rtsp_url(camera, local_port):
 
 
 def prepare_camera_input(camera, config):
-    effective, settings, _group = resolve_camera_runtime(camera, config)
+    effective, settings, group = resolve_camera_runtime(camera, config)
     if effective.get("type") != "cloud-p2p":
         return dict(effective), settings, None
 
-    tunnel = T2U_TUNNELS.acquire(effective, settings)
+    tunnel = T2U_TUNNELS.acquire(effective, settings, group)
     prepared = dict(effective)
     prepared["type"] = "stream"
     prepared["url"] = cloud_rtsp_url(effective, tunnel.local_port)
