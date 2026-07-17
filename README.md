@@ -8,7 +8,7 @@ Aplicacao local acessada pelo navegador para gravar em disco cameras ou entradas
 - Usa `-c copy` no FFmpeg para preservar a qualidade original de video/audio, sem recompressao.
 - Segmenta a gravacao em arquivos `.mkv`, por fonte e por data.
 - Reinicia streams automaticamente quando uma conexao cai.
-- Permite cadastrar URLs RTSP, HTTP/HTTPS, RTMP, SRT ou outros protocolos suportados pelo FFmpeg.
+- Permite cadastrar URLs de rede RTSP, HTTP/HTTPS, RTMP/RTMPS, SRT, UDP ou TCP. Protocolos de arquivo e entrada local via URL sao bloqueados.
 - Inclui um gerador de URL RTSP no formato comum:
   `rtsp://usuario:senha@host:554/cam/realmonitor?channel=1&subtype=0`
 - Tambem aceita dispositivos locais Linux via V4L2, como `/dev/video0`, e audio ALSA opcional.
@@ -32,8 +32,8 @@ make
 
 No Windows para Cloud/P2P:
 
-- FFmpeg instalado e configurado no PATH, ou com caminho absoluto configurado na tela.
-- SDK T2U com `libt2u.dll` na pasta do projeto ou o caminho da DLL configurado na tela.
+- FFmpeg instalado e configurado no PATH, ou com caminho absoluto definido localmente em `data/config.json`.
+- SDK T2U com `libt2u.dll` na pasta do projeto ou o caminho da DLL definido localmente em `data/config.json`.
 - Se a DLL for `x86 / PE32`, use Python 32-bit. Se tiver uma DLL x64, use Python 64-bit.
 
 ## Biblioteca T2U
@@ -86,11 +86,14 @@ Depois de acessar, altere em `Gravacao > Acesso`:
 
 A senha nao e gravada em texto plano. Quando a configuracao e salva, o app armazena um hash PBKDF2-SHA256 em `data/config.json`. Se uma senha curta for colocada manualmente nesse arquivo, ela sera convertida automaticamente para hash na proxima carga da configuracao.
 
+Credenciais T2U, P2P, RTSP e URLs com autenticacao nao sao devolvidas pela API. Campos de senha vazios na edicao mantem o valor existente. Para remover deliberadamente uma credencial, edite `data/config.json` localmente com o servico parado.
+
+O servidor recusa enderecos diferentes de loopback quando nao ha senha. Tambem recusa HTTP publico sem TLS, exceto quando o risco e confirmado explicitamente com `--allow-insecure-http`. Para acesso pela internet, mantenha o app em `127.0.0.1` e use o procedimento de [SECURITY.md](SECURITY.md).
+
 ## Cloud/P2P
 
-Na tela `T2U Clouds`, configure:
+O caminho da biblioteca T2U e controlado pelo servidor e deve ser definido localmente em `data/config.json`. Na tela `T2U Clouds`, configure os demais dados:
 
-- `Biblioteca T2U`: caminho da `libt2u.so` no Linux ou da `libt2u.dll` no Windows.
 - `Servidor`, `Porta`, `Chave do servidor` e `Senha T2U/P2P padrao`: valores do ambiente T2U que voce esta autorizado a usar.
 - `Timeout T2U`: tempo maximo para conectar ao servidor e abrir o tunel.
 
@@ -136,11 +139,38 @@ Isso preserva codec, resolucao, FPS, bitrate e audio que chegam da camera. Use o
 Exemplo de instalacao:
 
 ```bash
+sudo useradd --system --home-dir /opt/anhanga-recorder --shell /usr/sbin/nologin anhanga-recorder
 sudo mkdir -p /opt/anhanga-recorder
 sudo cp -r . /opt/anhanga-recorder
+sudo chown -R root:root /opt/anhanga-recorder
+sudo install -d -m 0700 -o anhanga-recorder -g anhanga-recorder /opt/anhanga-recorder/data
+sudo install -d -m 0700 -o anhanga-recorder -g anhanga-recorder /opt/anhanga-recorder/recordings
+sudo chown -R anhanga-recorder:anhanga-recorder /opt/anhanga-recorder/data /opt/anhanga-recorder/recordings
 sudo cp camera-recorder.service /etc/systemd/system/anhanga-recorder.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now anhanga-recorder
 ```
 
-Se publicar a interface fora do `127.0.0.1`, coloque autenticacao e firewall na frente. O app armazena URLs de cameras em `data/config.json`, que podem conter credenciais.
+O servico roda sem privilegios, aplica `UMask=0077` e continua limitado ao loopback. Se usar V4L2/ALSA, conceda ao usuario do servico os grupos de dispositivo estritamente necessarios.
+
+## Limites de preview
+
+Os previews MJPEG sao limitados por padrao a 8 processos simultaneos no servidor, 8 por cliente e 30 minutos por conexao. Os limites podem ser reduzidos ou ampliados por variaveis de ambiente no servico:
+
+```ini
+Environment=CAMERA_RECORDER_MAX_PREVIEWS=8
+Environment=CAMERA_RECORDER_MAX_PREVIEWS_PER_CLIENT=8
+Environment=CAMERA_RECORDER_PREVIEW_MAX_SECONDS=1800
+```
+
+Os caminhos `outputDir`, `ffmpegPath`, `ffprobePath` e `t2uDllPath` nao podem ser alterados pela API web. Isso impede que uma credencial web comprometida seja usada para carregar executaveis/DLLs ou gravar em caminhos arbitrarios do servidor.
+
+## Testes de seguranca
+
+No Linux ou WSL:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Os testes usam configuracao, porta HTTP e diretorios temporarios. Eles nao acessam cameras nem a rede T2U.

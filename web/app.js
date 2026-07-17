@@ -19,9 +19,14 @@ const DEFAULT_RTSP_PATH = "/cam/realmonitor?channel=1&subtype=0";
 const $ = (id) => document.getElementById(id);
 
 async function api(path, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Recorder-Request": "1",
+    ...(options.headers || {}),
+  };
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers,
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -101,7 +106,7 @@ function sourceSubtitle(camera) {
     const groupName = group?.name || camera.group || "Sem grupo";
     return `${groupName} · ${deviceId} · ${remoteIp}:${remotePort} · ${cloud?.name || "Cloud"} · ${camera.rtspPath || ""}`;
   }
-  return camera.url || "Sem URL";
+  return camera.url || (camera.urlConfigured ? "URL configurada" : "Sem URL");
 }
 
 function cameraGroupName(camera) {
@@ -397,7 +402,7 @@ function renderPreviews() {
 function renderSettings() {
   const settings = state.config?.settings;
   if (!settings) return;
-  $("outputDir").value = settings.outputDir || "";
+  $("outputDir").value = settings.outputDirDisplay || "Configurado no servidor";
   $("segmentSeconds").value = String(settings.segmentSeconds || 900);
   $("rtspTransport").value = settings.rtspTransport || "tcp";
   $("mapMode").value = settings.mapMode || "av";
@@ -460,7 +465,7 @@ function renderSystem(system) {
   const ffmpeg = system?.ffmpeg?.found ? "FFmpeg ok" : "FFmpeg nao encontrado";
   const t2uLine = t2u.loadable ? "T2U ok" : (t2u.message || "T2U indisponivel");
   const free = disk.free ? `${fmtBytes(disk.free)} livres` : "disco indisponivel";
-  $("systemLine").textContent = `${ffmpeg} · ${t2uLine} · ${free} · ${disk.path || ""}`;
+  $("systemLine").textContent = `${ffmpeg} · ${t2uLine} · ${free}`;
 }
 
 function renderLogs(logs) {
@@ -523,6 +528,9 @@ function loadForm(camera = null) {
   $("name").value = camera?.name || "";
   $("type").value = camera?.type || "stream";
   $("url").value = camera?.url || "";
+  $("url").placeholder = camera?.urlConfigured
+    ? "Manter URL atual"
+    : "rtsp://usuario:senha@host:554/...";
   $("videoDevice").value = camera?.videoDevice || "/dev/video0";
   $("audioDevice").value = camera?.audioDevice || "";
   $("resolution").value = camera?.resolution || "";
@@ -550,7 +558,6 @@ function formT2uCloud() {
   return {
     id: $("t2uCloudId").value || makeLocalId("cloud"),
     name: $("t2uCloudName").value.trim() || "T2U Cloud",
-    t2uDllPath: $("t2uDllPath").value.trim(),
     t2uServer: $("t2uServer").value.trim(),
     t2uServerPort: Number($("t2uServerPort").value || 0),
     t2uServerKey: $("t2uServerKey").value,
@@ -564,11 +571,13 @@ function loadT2uCloudForm(cloud = null) {
   $("t2uCloudSelect").value = cloud?.id || "";
   $("t2uCloudId").value = cloud?.id || "";
   $("t2uCloudName").value = cloud?.name || "";
-  $("t2uDllPath").value = cloud?.t2uDllPath || "./native/libt2u.so";
+  $("t2uDllPath").value = cloud?.t2uDllPathDisplay || "Configurado no servidor";
   $("t2uServer").value = cloud?.t2uServer || "";
   $("t2uServerPort").value = String(cloud?.t2uServerPort || 0);
-  $("t2uServerKey").value = cloud?.t2uServerKey || "";
-  $("t2uDevicePassword").value = cloud?.t2uDevicePassword || "";
+  $("t2uServerKey").value = "";
+  $("t2uServerKey").placeholder = cloud?.t2uServerKeyConfigured ? "Manter atual" : "";
+  $("t2uDevicePassword").value = "";
+  $("t2uDevicePassword").placeholder = cloud?.t2uDevicePasswordConfigured ? "Manter atual" : "";
   $("t2uConnectTimeoutSeconds").value = String(cloud?.t2uConnectTimeoutSeconds || 30);
   $("deleteT2uCloud").hidden = !cloud;
 }
@@ -598,12 +607,16 @@ function loadSourceGroupForm(group = null) {
   $("sourceGroupCloudId").value = group?.t2uCloudId || t2uClouds()[0]?.id || "";
   $("sourceGroupMaxSources").value = String(group?.maxSources || 0);
   $("sourceGroupP2pUuid").value = group?.p2pUuid || "";
-  $("sourceGroupP2pPassword").value = group?.p2pPassword || "";
+  $("sourceGroupP2pPassword").value = "";
+  $("sourceGroupP2pPassword").placeholder = group?.p2pPasswordConfigured
+    ? "Manter atual"
+    : "Usar senha padrao da cloud";
   $("sourceGroupP2pRemoteIp").value = group?.p2pRemoteIp || "127.0.0.1";
   $("sourceGroupP2pRemotePort").value = String(group?.p2pRemotePort || 554);
   $("sourceGroupP2pLocalPort").value = String(group?.p2pLocalPort || 0);
   $("sourceGroupRtspUser").value = group?.rtspUser || "";
-  $("sourceGroupRtspPassword").value = group?.rtspPassword || "";
+  $("sourceGroupRtspPassword").value = "";
+  $("sourceGroupRtspPassword").placeholder = group?.rtspPasswordConfigured ? "Manter atual" : "";
   $("sourceGroupEnabled").checked = group?.enabled ?? true;
   $("deleteSourceGroup").hidden = !group;
 }
@@ -702,7 +715,6 @@ async function saveSettings() {
   const newPassword = $("webPassword").value;
   config.settings = {
     ...config.settings,
-    outputDir: $("outputDir").value.trim(),
     segmentSeconds: Number($("segmentSeconds").value),
     rtspTransport: $("rtspTransport").value,
     mapMode: $("mapMode").value,

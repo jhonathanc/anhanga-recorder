@@ -9,6 +9,7 @@ import base64
 import ctypes
 import hashlib
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -16,6 +17,7 @@ import platform
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -47,6 +49,30 @@ SOURCE_GROUP_KEYS = (
     "rtspUser",
     "rtspPassword",
 )
+SETTINGS_SECRET_KEYS = ("t2uServerKey", "t2uDevicePassword")
+T2U_CLOUD_SECRET_KEYS = ("t2uServerKey", "t2uDevicePassword")
+SOURCE_GROUP_SECRET_KEYS = ("p2pPassword", "rtspPassword")
+CAMERA_SECRET_KEYS = ("p2pPassword", "rtspPassword")
+SERVER_MANAGED_SETTING_KEYS = ("outputDir", "ffmpegPath", "ffprobePath", "t2uDllPath")
+SERVER_MANAGED_CLOUD_KEYS = ("t2uDllPath",)
+ALLOWED_STREAM_SCHEMES = ("rtsp", "rtsps", "http", "https", "rtmp", "rtmps", "srt", "udp", "tcp")
+AUTH_FAILURE_WINDOW_SECONDS = 5 * 60
+AUTH_MAX_FAILURES = 10
+AUTH_BLOCK_SECONDS = 15 * 60
+DEFAULT_MAX_PREVIEWS = 8
+DEFAULT_MAX_PREVIEWS_PER_CLIENT = 8
+DEFAULT_PREVIEW_MAX_SECONDS = 30 * 60
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
 
 DEFAULT_CONFIG = {
     "settings": {
@@ -77,8 +103,12 @@ DEFAULT_CONFIG = {
 CONFIG_LOCK = threading.RLock()
 JOBS_LOCK = threading.RLock()
 LOG_LOCK = threading.RLock()
+AUTH_LOCK = threading.RLock()
+PREVIEW_LOCK = threading.RLock()
 JOBS = {}
 LOGS = []
+AUTH_FAILURES = {}
+ACTIVE_PREVIEWS = {}
 PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 120000
 PASSWORD_MAX_LENGTH = 50
@@ -129,12 +159,40 @@ def resolve_app_path(value):
     return path.resolve()
 
 
+def path_display_name(value, fallback="Configurado no servidor"):
+    raw = str(value or "").strip()
+    if not raw:
+        return fallback
+    return Path(raw.rstrip("/\\")).name or fallback
+
+
 def bounded_int(value, default, minimum, maximum):
     try:
         number = int(value)
     except (TypeError, ValueError):
         number = default
     return max(minimum, min(maximum, number))
+
+
+def environment_int(name, default, minimum, maximum):
+    return bounded_int(os.environ.get(name, default), default, minimum, maximum)
+
+
+def is_loopback_host(host):
+    text = str(host or "").strip().strip("[]")
+    if text.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
+def environment_flag(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 def reconnect_delay_for_failures(failures):
@@ -162,6 +220,10 @@ class T2uBackoffError(RuntimeError):
         self.retry_after = max(1, int(retry_after or 1))
 
 
+class T2uTunnelUnavailableError(RuntimeError):
+    pass
+
+
 def safe_name(value):
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip()).strip("._-")
     return name[:80] or "camera"
@@ -182,10 +244,24 @@ def unique_text_id(value, seen, fallback):
     return candidate
 
 
+URL_AUTH_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+URL_AUTH_ANYWHERE_PATTERN = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+
+
 def redact_url(text):
     if not text:
         return text
-    return re.sub(r"((?:rtsp|rtsps|http|https|rtmp|srt)://)([^/@\s]+)@", r"\1***@", str(text))
+    return URL_AUTH_ANYWHERE_PATTERN.sub(r"\1***@", str(text))
+
+
+def strip_url_credentials(text):
+    if not text:
+        return text
+    return URL_AUTH_PATTERN.sub(r"\1", str(text))
+
+
+def url_has_credentials(text):
+    return bool(text and URL_AUTH_PATTERN.search(str(text)))
 
 
 def pe_machine(path):
@@ -266,9 +342,10 @@ def add_log(source_id, level, message):
 
 def load_config():
     with CONFIG_LOCK:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not CONFIG_PATH.exists():
             return save_config(DEFAULT_CONFIG)
+        ensure_private_config_permissions()
         try:
             with CONFIG_PATH.open("r", encoding="utf-8") as handle:
                 loaded = json.load(handle)
@@ -281,15 +358,29 @@ def load_config():
         return normalized
 
 
+def ensure_private_config_permissions():
+    if os.name == "nt":
+        return
+    try:
+        DATA_DIR.chmod(0o700)
+        if CONFIG_PATH.exists():
+            CONFIG_PATH.chmod(0o600)
+    except OSError as exc:
+        raise RuntimeError("Nao foi possivel restringir as permissoes da configuracao.") from exc
+
+
 def save_config(config):
     with CONFIG_LOCK:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         normalized = normalize_config(config)
         tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
         with tmp_path.open("w", encoding="utf-8") as handle:
             json.dump(normalized, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
+        if os.name != "nt":
+            tmp_path.chmod(0o600)
         tmp_path.replace(CONFIG_PATH)
+        ensure_private_config_permissions()
         return normalized
 
 
@@ -391,6 +482,9 @@ def normalize_settings(settings):
     )
     merged.pop("webPasswordHash", None)
     merged.pop("webPasswordConfigured", None)
+    for key in (*SETTINGS_SECRET_KEYS, *SERVER_MANAGED_SETTING_KEYS):
+        merged.pop(f"{key}Configured", None)
+        merged.pop(f"{key}Display", None)
     merged["t2uDllPath"] = str(merged.get("t2uDllPath") or DEFAULT_T2U_DLL).strip()
     merged["t2uServer"] = str(merged.get("t2uServer") or "").strip()
     merged["t2uServerPort"] = bounded_int(merged.get("t2uServerPort", 0), 0, 0, 65535)
@@ -441,6 +535,9 @@ def normalize_t2u_clouds(clouds, settings):
         )
         item["createdAt"] = str(item.get("createdAt") or now_iso())
         item["updatedAt"] = str(item.get("updatedAt") or now_iso())
+        for key in (*T2U_CLOUD_SECRET_KEYS, *SERVER_MANAGED_CLOUD_KEYS):
+            item.pop(f"{key}Configured", None)
+            item.pop(f"{key}Display", None)
         normalized.append(item)
     return normalized or normalize_t2u_clouds([t2u_cloud_from_settings(settings)], settings)
 
@@ -474,6 +571,8 @@ def normalize_source_groups(groups, t2u_clouds):
         item["enabled"] = bool(item.get("enabled", True))
         item["createdAt"] = str(item.get("createdAt") or now_iso())
         item["updatedAt"] = str(item.get("updatedAt") or now_iso())
+        for key in SOURCE_GROUP_SECRET_KEYS:
+            item.pop(f"{key}Configured", None)
         normalized.append(item)
     return normalized
 
@@ -516,6 +615,10 @@ def normalize_cameras(cameras):
         item["enabled"] = bool(item.get("enabled", True))
         item["createdAt"] = str(item.get("createdAt") or now_iso())
         item["updatedAt"] = str(item.get("updatedAt") or now_iso())
+        for key in CAMERA_SECRET_KEYS:
+            item.pop(f"{key}Configured", None)
+        item.pop("urlConfigured", None)
+        item.pop("urlCredentialsConfigured", None)
         normalized.append(item)
     return normalized
 
@@ -604,7 +707,96 @@ def public_config(config):
     settings["webPasswordConfigured"] = bool(settings.get("webPassword"))
     settings.pop("webPassword", None)
     settings.pop("webPasswordHash", None)
+    for key in SETTINGS_SECRET_KEYS:
+        settings[f"{key}Configured"] = bool(settings.get(key))
+        settings.pop(key, None)
+    for key in SERVER_MANAGED_SETTING_KEYS:
+        settings[f"{key}Display"] = path_display_name(settings.get(key))
+        settings.pop(key, None)
+
+    for cloud in visible.get("t2uClouds", []):
+        for key in T2U_CLOUD_SECRET_KEYS:
+            cloud[f"{key}Configured"] = bool(cloud.get(key))
+            cloud.pop(key, None)
+        for key in SERVER_MANAGED_CLOUD_KEYS:
+            cloud[f"{key}Display"] = path_display_name(cloud.get(key))
+            cloud.pop(key, None)
+
+    for group in visible.get("sourceGroups", []):
+        for key in SOURCE_GROUP_SECRET_KEYS:
+            group[f"{key}Configured"] = bool(group.get(key))
+            group.pop(key, None)
+
+    for camera in visible.get("cameras", []):
+        for key in CAMERA_SECRET_KEYS:
+            camera[f"{key}Configured"] = bool(camera.get(key))
+            camera.pop(key, None)
+        camera["urlConfigured"] = bool(camera.get("url"))
+        camera["urlCredentialsConfigured"] = url_has_credentials(camera.get("url"))
+        if camera["urlConfigured"]:
+            camera["url"] = ""
     return visible
+
+
+def preserve_secret_fields(current, incoming, keys):
+    current = current or {}
+    for key in keys:
+        if not str(incoming.get(key) or ""):
+            incoming[key] = current.get(key, "")
+        incoming.pop(f"{key}Configured", None)
+
+
+def prepare_config_update(current, payload):
+    incoming = dict(payload or {})
+    current_settings = current.get("settings", {})
+    settings = {**current_settings, **dict(incoming.get("settings") or {})}
+    if not str(settings.get("webPassword", settings.get("webPasswordHash", "")) or ""):
+        settings["webPassword"] = current_settings.get("webPassword", "")
+    settings.pop("webPasswordConfigured", None)
+    preserve_secret_fields(current_settings, settings, SETTINGS_SECRET_KEYS)
+    for key in SERVER_MANAGED_SETTING_KEYS:
+        settings[key] = current_settings.get(key, DEFAULT_CONFIG["settings"].get(key))
+        settings.pop(f"{key}Display", None)
+    incoming["settings"] = settings
+
+    current_clouds = {item.get("id"): item for item in current.get("t2uClouds", [])}
+    clouds = []
+    for raw_cloud in incoming.get("t2uClouds", current.get("t2uClouds", [])):
+        cloud = dict(raw_cloud or {})
+        existing = current_clouds.get(cloud.get("id"), {})
+        preserve_secret_fields(existing, cloud, T2U_CLOUD_SECRET_KEYS)
+        for key in SERVER_MANAGED_CLOUD_KEYS:
+            cloud[key] = existing.get(key, current_settings.get(key, DEFAULT_T2U_DLL))
+            cloud.pop(f"{key}Display", None)
+        clouds.append(cloud)
+    incoming["t2uClouds"] = clouds
+
+    current_groups = {item.get("id"): item for item in current.get("sourceGroups", [])}
+    groups = []
+    for raw_group in incoming.get("sourceGroups", current.get("sourceGroups", [])):
+        group = dict(raw_group or {})
+        preserve_secret_fields(current_groups.get(group.get("id"), {}), group, SOURCE_GROUP_SECRET_KEYS)
+        groups.append(group)
+    incoming["sourceGroups"] = groups
+
+    current_cameras = {item.get("id"): item for item in current.get("cameras", [])}
+    cameras = []
+    for raw_camera in incoming.get("cameras", current.get("cameras", [])):
+        camera = dict(raw_camera or {})
+        existing = current_cameras.get(camera.get("id"), {})
+        preserve_secret_fields(existing, camera, CAMERA_SECRET_KEYS)
+        old_url = str(existing.get("url") or "")
+        new_url = str(camera.get("url") or "")
+        if old_url and (
+            not new_url
+            or (url_has_credentials(old_url) and new_url in (strip_url_credentials(old_url), redact_url(old_url)))
+        ):
+            camera["url"] = old_url
+        camera.pop("urlCredentialsConfigured", None)
+        camera.pop("urlConfigured", None)
+        cameras.append(camera)
+    incoming["cameras"] = cameras
+    return incoming
 
 
 def find_camera(config, camera_id):
@@ -914,36 +1106,50 @@ class T2uRuntime:
         remote_port = int(camera.get("p2pRemotePort") or 554)
         local_port = int(camera.get("p2pLocalPort") or 0)
         timeout = int(settings.get("t2uConnectTimeoutSeconds") or 30)
-
-        with self._lock:
-            mapped_port = dll.t2u_add_port_v3(
-                self._bytes(uuid_value, "ID do dispositivo P2P"),
-                self._bytes(password, "senha T2U/P2P"),
-                self._bytes(remote_ip, "IP remoto T2U"),
-                remote_port,
-                local_port,
-            )
-        if mapped_port <= 0:
-            raise RuntimeError(f"T2U nao criou a porta local. Retorno: {mapped_port}")
-
-        tunnel = T2uTunnel(self, mapped_port, remote_ip, remote_port)
-        deadline = time.time() + timeout
+        attempts = 2
+        overall_deadline = time.monotonic() + timeout
         last_status = None
-        while time.time() < deadline:
-            stat = T2uNetStat()
-            with self._lock:
-                last_status = dll.t2u_port_status(mapped_port, ctypes.byref(stat))
-            if last_status > 0:
-                tunnel.status = last_status
-                tunnel.stat = stat
-                return tunnel
-            if last_status < 0:
-                tunnel.close()
-                raise RuntimeError(f"T2U falhou ao abrir tunel na porta {mapped_port}. Status: {last_status}")
-            time.sleep(0.1)
 
-        tunnel.close()
-        raise RuntimeError(f"T2U nao abriu tunel em {timeout}s. Ultimo status: {last_status}")
+        for attempt in range(1, attempts + 1):
+            with self._lock:
+                mapped_port = dll.t2u_add_port_v3(
+                    self._bytes(uuid_value, "ID do dispositivo P2P"),
+                    self._bytes(password, "senha T2U/P2P"),
+                    self._bytes(remote_ip, "IP remoto T2U"),
+                    remote_port,
+                    local_port,
+                )
+            if mapped_port <= 0:
+                raise T2uTunnelUnavailableError(f"T2U nao criou a porta local. Retorno: {mapped_port}")
+
+            tunnel = T2uTunnel(self, mapped_port, remote_ip, remote_port)
+            remaining = max(0.0, overall_deadline - time.monotonic())
+            attempts_left = attempts - attempt + 1
+            attempt_budget = max(3.0, remaining / attempts_left) if remaining else 0.0
+            attempt_deadline = min(overall_deadline, time.monotonic() + attempt_budget)
+            last_status = None
+            while time.monotonic() < attempt_deadline:
+                stat = T2uNetStat()
+                with self._lock:
+                    last_status = dll.t2u_port_status(mapped_port, ctypes.byref(stat))
+                if last_status > 0:
+                    tunnel.status = last_status
+                    tunnel.stat = stat
+                    return tunnel
+                if last_status < 0:
+                    tunnel.close()
+                    raise T2uTunnelUnavailableError(
+                        f"T2U falhou ao abrir tunel na porta {mapped_port}. Status: {last_status}"
+                    )
+                time.sleep(0.1)
+
+            tunnel.close()
+            if attempt < attempts and time.monotonic() < overall_deadline:
+                time.sleep(0.25)
+
+        raise T2uTunnelUnavailableError(
+            f"T2U nao abriu tunel em {timeout}s apos {attempts} tentativas. Ultimo status: {last_status}"
+        )
 
     def close_port(self, port):
         with self._lock:
@@ -1284,6 +1490,44 @@ def write_mjpeg_frames(handler, proc):
             handler.wfile.flush()
 
 
+class PreviewLimitError(RuntimeError):
+    pass
+
+
+def acquire_preview_slot(client_ip, camera_id):
+    global_limit = environment_int("CAMERA_RECORDER_MAX_PREVIEWS", DEFAULT_MAX_PREVIEWS, 1, 64)
+    client_limit = environment_int(
+        "CAMERA_RECORDER_MAX_PREVIEWS_PER_CLIENT",
+        DEFAULT_MAX_PREVIEWS_PER_CLIENT,
+        1,
+        global_limit,
+    )
+    with PREVIEW_LOCK:
+        active_for_client = sum(1 for item in ACTIVE_PREVIEWS.values() if item["clientIp"] == client_ip)
+        if len(ACTIVE_PREVIEWS) >= global_limit or active_for_client >= client_limit:
+            raise PreviewLimitError("Limite de previews simultaneos atingido.")
+        token = uuid.uuid4().hex
+        ACTIVE_PREVIEWS[token] = {
+            "clientIp": client_ip,
+            "cameraId": camera_id,
+            "startedAt": time.time(),
+        }
+    max_seconds = environment_int(
+        "CAMERA_RECORDER_PREVIEW_MAX_SECONDS",
+        DEFAULT_PREVIEW_MAX_SECONDS,
+        30,
+        24 * 60 * 60,
+    )
+    return token, max_seconds
+
+
+def release_preview_slot(token):
+    if not token:
+        return
+    with PREVIEW_LOCK:
+        ACTIVE_PREVIEWS.pop(token, None)
+
+
 def stream_preview(handler, camera_id):
     config = load_config()
     camera = find_camera(config, camera_id)
@@ -1291,9 +1535,13 @@ def stream_preview(handler, camera_id):
         send_error_json(handler, 404, "Camera nao encontrada.")
         return
 
+    slot = None
     tunnel = None
     proc = None
+    timer = None
+    response_started = False
     try:
+        slot, max_seconds = acquire_preview_slot(handler.client_ip(), camera_id)
         validate_camera(camera, config)
         effective_camera, effective_settings, tunnel = prepare_camera_input(camera, config)
         if tunnel:
@@ -1314,34 +1562,48 @@ def stream_preview(handler, camera_id):
             stderr=subprocess.PIPE,
             bufsize=0,
         )
-    except FileNotFoundError as exc:
-        if tunnel:
-            log_tunnel_release(camera_id, tunnel.close(), "Tunel P2P de preview")
-        send_error_json(handler, 500, f"FFmpeg nao encontrado: {exc}")
-        return
-    except Exception as exc:
-        if tunnel:
-            log_tunnel_release(camera_id, tunnel.close(), "Tunel P2P de preview")
-        send_error_json(handler, 500, str(exc))
-        return
-
-    if proc.stderr:
-        threading.Thread(target=preview_log_reader, args=(camera_id, proc.stderr), daemon=True).start()
-
-    try:
+        if proc.stderr:
+            threading.Thread(target=preview_log_reader, args=(camera_id, proc.stderr), daemon=True).start()
+        timer = threading.Timer(max_seconds, terminate_preview_process, args=(proc,))
+        timer.daemon = True
+        timer.start()
         handler.send_response(200)
         handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         handler.send_header("Pragma", "no-cache")
+        handler.send_header("X-Preview-Max-Seconds", str(max_seconds))
+        send_security_headers(handler)
         handler.end_headers()
+        response_started = True
         write_mjpeg_frames(handler, proc)
-    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+    except PreviewLimitError as exc:
+        send_error_json(handler, 429, str(exc), {"Retry-After": "5"})
+    except T2uBackoffError as exc:
+        send_error_json(handler, 503, str(exc), {"Retry-After": str(exc.retry_after)})
+    except T2uTunnelUnavailableError as exc:
+        add_log(camera_id, "warning", f"Tunel P2P temporariamente indisponivel: {exc}")
+        send_error_json(handler, 503, "Tunel P2P temporariamente indisponivel.", {"Retry-After": "5"})
+    except ValueError as exc:
+        send_error_json(handler, 400, str(exc))
+    except FileNotFoundError as exc:
+        add_log(camera_id, "error", f"FFmpeg de preview nao encontrado: {exc}")
+        if not response_started:
+            send_error_json(handler, 500, "FFmpeg nao encontrado no servidor.")
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         pass
+    except Exception as exc:
+        add_log(camera_id, "error", f"Falha ao iniciar preview: {exc}")
+        if not response_started:
+            send_error_json(handler, 500, "Nao foi possivel iniciar o preview.")
     finally:
+        if timer:
+            timer.cancel()
         terminate_preview_process(proc)
         if tunnel:
             log_tunnel_release(camera_id, tunnel.close(), "Tunel P2P de preview")
-        add_log(camera_id, "info", f"Preview encerrado: {camera.get('name')}")
+        release_preview_slot(slot)
+        if proc:
+            add_log(camera_id, "info", f"Preview encerrado: {camera.get('name')}")
 
 
 class RecordingJob:
@@ -1738,11 +2000,17 @@ def start_recording(camera_ids, all_enabled=False):
                     {
                         "id": camera.get("id"),
                         "name": camera.get("name"),
-                        "message": f"{exc}; reconexao automatica agendada.",
+                        "message": f"{redact_config_paths(str(exc), config)}; reconexao automatica agendada.",
                     }
                 )
             else:
-                errors.append({"id": camera.get("id"), "name": camera.get("name"), "message": str(exc)})
+                errors.append(
+                    {
+                        "id": camera.get("id"),
+                        "name": camera.get("name"),
+                        "message": redact_config_paths(str(exc), config),
+                    }
+                )
     return {"started": started, "skipped": skipped, "errors": errors}
 
 
@@ -1774,6 +2042,106 @@ def ff_tool_status(path_value):
     except OSError as exc:
         return {"configured": path_value, "found": False, "path": str(explicit), "error": str(exc)}
     return {"configured": path_value, "found": found, "path": str(explicit) if found else None}
+
+
+def redact_config_paths(text, config):
+    redacted = str(text or "")
+    settings = (config or {}).get("settings", {})
+    secret_values = [settings.get("webPassword")]
+    secret_values.extend(settings.get(key) for key in SETTINGS_SECRET_KEYS)
+    for cloud in (config or {}).get("t2uClouds", []):
+        secret_values.extend(cloud.get(key) for key in T2U_CLOUD_SECRET_KEYS)
+    for group in (config or {}).get("sourceGroups", []):
+        secret_values.extend(group.get(key) for key in SOURCE_GROUP_SECRET_KEYS)
+    for camera in (config or {}).get("cameras", []):
+        secret_values.extend(camera.get(key) for key in CAMERA_SECRET_KEYS)
+        url = str(camera.get("url") or "")
+        for variant in (url, redact_url(url), strip_url_credentials(url)):
+            if len(variant) >= 4:
+                redacted = re.sub(re.escape(variant), "<stream>", redacted, flags=re.IGNORECASE)
+    for secret in secret_values:
+        value = str(secret or "")
+        if value:
+            redacted = redacted.replace(value, "***")
+    redacted = redact_url(redacted)
+    candidates = [APP_DIR, DATA_DIR, CONFIG_PATH]
+    for key in SERVER_MANAGED_SETTING_KEYS:
+        value = settings.get(key)
+        if not value:
+            continue
+        try:
+            candidates.append(resolve_user_path(value) if key == "outputDir" else resolve_app_path(value))
+        except OSError:
+            continue
+    for cloud in (config or {}).get("t2uClouds", []):
+        try:
+            candidates.append(resolve_app_path(cloud.get("t2uDllPath")))
+        except OSError:
+            continue
+    for candidate in candidates:
+        value = str(candidate or "")
+        if len(value) < 4:
+            continue
+        for variant in {value, value.replace("\\", "/")}:
+            redacted = re.sub(
+                re.escape(variant),
+                "<caminho>",
+                redacted,
+                flags=re.IGNORECASE if os.name == "nt" else 0,
+            )
+    return redacted
+
+
+def sanitize_public_value(value, config):
+    if isinstance(value, dict):
+        return {key: sanitize_public_value(item, config) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_public_value(item, config) for item in value]
+    if isinstance(value, str):
+        return redact_config_paths(value, config)
+    return value
+
+
+def public_log_rows(rows, config):
+    return [
+        {
+            **row,
+            "message": redact_config_paths(row.get("message"), config),
+        }
+        for row in rows
+    ]
+
+
+def public_job_snapshot(snapshot, config):
+    return {
+        "id": snapshot.get("id"),
+        "name": snapshot.get("name"),
+        "state": snapshot.get("state"),
+        "startedAt": snapshot.get("startedAt"),
+        "endedAt": snapshot.get("endedAt"),
+        "exitCode": snapshot.get("exitCode"),
+        "lastError": redact_config_paths(snapshot.get("lastError"), config) if snapshot.get("lastError") else None,
+        "nextRestartAt": snapshot.get("nextRestartAt"),
+        "cloudGroupId": snapshot.get("cloudGroupId"),
+        "cloudGroupName": snapshot.get("cloudGroupName"),
+        "restartCount": snapshot.get("restartCount", 0),
+    }
+
+
+def public_t2u_status(status):
+    return {
+        key: status.get(key)
+        for key in ("found", "format", "machine", "pythonBits", "loadable", "message", "backoff")
+    }
+
+
+def public_disk_status(status):
+    return {
+        "total": status.get("total"),
+        "used": status.get("used"),
+        "free": status.get("free"),
+        "available": not bool(status.get("error")),
+    }
 
 
 def disk_status(settings):
@@ -1810,7 +2178,6 @@ def list_recordings(limit=500):
                 {
                     "name": path.name,
                     "relativePath": str(relative),
-                    "path": str(path),
                     "size": stat.st_size,
                     "modified": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
                 }
@@ -1832,17 +2199,22 @@ def state_payload():
     config = load_config()
     t2u_status_settings = settings_for_t2u_cloud(config["settings"], find_t2u_cloud(config, None))
     with JOBS_LOCK:
-        jobs = {camera_id: job.snapshot() for camera_id, job in JOBS.items()}
+        jobs = {
+            camera_id: public_job_snapshot(job.snapshot(), config)
+            for camera_id, job in JOBS.items()
+        }
+    ffmpeg_status = ff_tool_status(config["settings"].get("ffmpegPath", "ffmpeg"))
+    ffprobe_status = ff_tool_status(config["settings"].get("ffprobePath", "ffprobe"))
     return {
         "version": VERSION,
         "config": public_config(config),
         "jobs": jobs,
-        "logs": recent_logs(limit=120),
+        "logs": public_log_rows(recent_logs(limit=120), config),
         "system": {
-            "ffmpeg": ff_tool_status(config["settings"].get("ffmpegPath", "ffmpeg")),
-            "ffprobe": ff_tool_status(config["settings"].get("ffprobePath", "ffprobe")),
-            "t2u": T2U.status_info(t2u_status_settings),
-            "disk": disk_status(config["settings"]),
+            "ffmpeg": {"found": ffmpeg_status.get("found", False)},
+            "ffprobe": {"found": ffprobe_status.get("found", False)},
+            "t2u": public_t2u_status(T2U.status_info(t2u_status_settings)),
+            "disk": public_disk_status(disk_status(config["settings"])),
             "time": now_iso(),
         },
     }
@@ -1877,17 +2249,27 @@ def probe_source(payload):
             if camera.get("frameRate"):
                 args += ["-framerate", camera["frameRate"]]
             args += ["-f", "v4l2", camera.get("videoDevice") or "/dev/video0"]
+    except T2uBackoffError as exc:
+        if tunnel:
+            log_tunnel_release(camera.get("id"), tunnel.close(), "Tunel P2P do teste")
+        return {"ok": False, "message": str(exc)}
+    except ValueError as exc:
+        if tunnel:
+            log_tunnel_release(camera.get("id"), tunnel.close(), "Tunel P2P do teste")
+        return {"ok": False, "message": str(exc)}
     except Exception as exc:
         if tunnel:
             log_tunnel_release(camera.get("id"), tunnel.close(), "Tunel P2P do teste")
-        return {"ok": False, "message": str(exc), "command": [redact_url(part) for part in args]}
+        add_log(camera.get("id"), "error", f"Falha ao preparar teste: {exc}")
+        return {"ok": False, "message": "Nao foi possivel preparar o teste da fonte."}
 
     try:
         completed = subprocess.run(args, capture_output=True, text=True, timeout=15, encoding="utf-8", errors="replace")
     except FileNotFoundError as exc:
-        return {"ok": False, "message": f"ffprobe nao encontrado: {exc}", "command": [redact_url(part) for part in args]}
+        add_log(camera.get("id"), "error", f"ffprobe nao encontrado: {exc}")
+        return {"ok": False, "message": "ffprobe nao encontrado no servidor."}
     except subprocess.TimeoutExpired:
-        return {"ok": False, "message": "ffprobe excedeu 15s.", "command": [redact_url(part) for part in args]}
+        return {"ok": False, "message": "ffprobe excedeu 15s."}
     finally:
         if tunnel:
             log_tunnel_release(camera.get("id"), tunnel.close(), "Tunel P2P do teste")
@@ -1895,14 +2277,16 @@ def probe_source(payload):
     if completed.returncode != 0:
         return {
             "ok": False,
-            "message": completed.stderr.strip() or f"ffprobe saiu com codigo {completed.returncode}",
-            "command": [redact_url(part) for part in args],
+            "message": redact_config_paths(
+                completed.stderr.strip() or f"ffprobe saiu com codigo {completed.returncode}",
+                config,
+            ),
         }
     try:
         data = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError:
         data = {"raw": completed.stdout}
-    return {"ok": True, "data": data, "command": [redact_url(part) for part in args]}
+    return {"ok": True, "data": sanitize_public_value(data, config)}
 
 
 def local_devices():
@@ -1912,8 +2296,14 @@ def local_devices():
 
 
 def read_json(handler):
-    length = int(handler.headers.get("Content-Length") or 0)
-    if length > 1024 * 1024:
+    content_type = str(handler.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if content_type and content_type != "application/json":
+        raise ValueError("Content-Type deve ser application/json.")
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+    except ValueError as exc:
+        raise ValueError("Content-Length invalido.") from exc
+    if length < 0 or length > 1024 * 1024:
         raise ValueError("Payload muito grande.")
     if not length:
         return {}
@@ -1923,18 +2313,28 @@ def read_json(handler):
     return json.loads(raw.decode("utf-8"))
 
 
-def send_json(handler, status, payload):
+def send_security_headers(handler):
+    for name, value in SECURITY_HEADERS.items():
+        handler.send_header(name, value)
+    if getattr(handler.server, "is_tls", False):
+        handler.send_header("Strict-Transport-Security", "max-age=31536000")
+
+
+def send_json(handler, status, payload, headers=None):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
+    for name, value in (headers or {}).items():
+        handler.send_header(name, value)
+    send_security_headers(handler)
     handler.end_headers()
     handler.wfile.write(body)
 
 
-def send_error_json(handler, status, message):
-    send_json(handler, status, {"error": message})
+def send_error_json(handler, status, message, headers=None):
+    send_json(handler, status, {"error": message}, headers)
 
 
 def expected_web_credentials():
@@ -1958,31 +2358,136 @@ def parse_basic_auth(value):
     return user, password
 
 
+def authentication_retry_after(client_ip):
+    now = time.time()
+    with AUTH_LOCK:
+        state = AUTH_FAILURES.get(client_ip)
+        if not state:
+            return 0
+        blocked_until = float(state.get("blockedUntil") or 0)
+        if blocked_until > now:
+            return max(1, int(blocked_until - now))
+        failures = [stamp for stamp in state.get("failures", []) if now - stamp <= AUTH_FAILURE_WINDOW_SECONDS]
+        if failures:
+            state["failures"] = failures
+            state["blockedUntil"] = 0
+        else:
+            AUTH_FAILURES.pop(client_ip, None)
+        return 0
+
+
+def record_authentication_failure(client_ip):
+    now = time.time()
+    with AUTH_LOCK:
+        state = AUTH_FAILURES.setdefault(client_ip, {"failures": [], "blockedUntil": 0})
+        state["failures"] = [
+            stamp for stamp in state.get("failures", []) if now - stamp <= AUTH_FAILURE_WINDOW_SECONDS
+        ]
+        state["failures"].append(now)
+        if len(state["failures"]) >= AUTH_MAX_FAILURES:
+            state["blockedUntil"] = now + AUTH_BLOCK_SECONDS
+            return AUTH_BLOCK_SECONDS
+    return 0
+
+
+def clear_authentication_failures(client_ip):
+    with AUTH_LOCK:
+        AUTH_FAILURES.pop(client_ip, None)
+
+
+def origin_matches_host(origin_value, host_value):
+    try:
+        origin = urlparse(str(origin_value or ""))
+        if origin.scheme not in ("http", "https") or not origin.hostname or origin.username or origin.password:
+            return False
+        host = urlparse(f"//{host_value}")
+        if not host.hostname or host.username or host.password:
+            return False
+        default_port = 443 if origin.scheme == "https" else 80
+        return (
+            origin.hostname.lower(),
+            origin.port or default_port,
+        ) == (
+            host.hostname.lower(),
+            host.port or default_port,
+        )
+    except ValueError:
+        return False
+
+
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = f"AnhangaRecorder/{VERSION}"
+    server_version = "Recorder"
+    sys_version = ""
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(20)
 
     def log_message(self, fmt, *args):
         add_log(None, "http", "%s - %s" % (self.address_string(), fmt % args))
 
+    def client_ip(self):
+        peer = str(self.client_address[0] or "")
+        if is_loopback_host(peer):
+            forwarded = str(self.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+            try:
+                if forwarded:
+                    return str(ipaddress.ip_address(forwarded))
+            except ValueError:
+                pass
+        return peer
+
     def is_authenticated(self):
         expected_user, stored_password = expected_web_credentials()
         user, password = parse_basic_auth(self.headers.get("Authorization"))
-        return hmac.compare_digest(user or "", expected_user) and verify_web_password(password or "", stored_password)
+        user_matches = hmac.compare_digest(user or "", expected_user)
+        password_matches = verify_web_password(password or "", stored_password)
+        return user_matches and password_matches
 
-    def request_authentication(self):
-        body = b"Autenticacao requerida.\n"
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", f'Basic realm="{APP_NAME}", charset="UTF-8"')
+    def request_authentication(self, retry_after=0):
+        blocked = retry_after > 0
+        body = ("Muitas tentativas. Tente novamente mais tarde.\n" if blocked else "Autenticacao requerida.\n").encode("utf-8")
+        self.send_response(429 if blocked else 401)
+        if not blocked:
+            self.send_header("WWW-Authenticate", f'Basic realm="{APP_NAME}", charset="UTF-8"')
+        else:
+            self.send_header("Retry-After", str(retry_after))
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        send_security_headers(self)
         self.end_headers()
         self.wfile.write(body)
 
     def require_authentication(self):
+        client_ip = self.client_ip()
+        retry_after = authentication_retry_after(client_ip)
+        if retry_after:
+            self.request_authentication(retry_after)
+            return False
         if self.is_authenticated():
+            clear_authentication_failures(client_ip)
             return True
-        self.request_authentication()
+        self.request_authentication(record_authentication_failure(client_ip))
+        return False
+
+    def require_same_origin(self, mutation=False):
+        fetch_site = str(self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        origin = self.headers.get("Origin")
+        rejected = fetch_site in ("cross-site", "same-site")
+        if mutation and fetch_site and fetch_site not in ("same-origin", "none"):
+            rejected = True
+        if origin and not origin_matches_host(origin, self.headers.get("Host")):
+            rejected = True
+        if rejected:
+            send_error_json(self, 403, "Origem da requisicao nao permitida.")
+            return False
+        return True
+
+    def require_mutation_marker(self):
+        if hmac.compare_digest(str(self.headers.get("X-Recorder-Request") or ""), "1"):
+            return True
+        send_error_json(self, 403, "Cabecalho de seguranca ausente.")
         return False
 
     def do_GET(self):
@@ -1990,6 +2495,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/"):
+            if not self.require_same_origin():
+                return
             self.handle_api_get(parsed)
             return
         self.serve_static(parsed.path)
@@ -1997,15 +2504,27 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.require_authentication():
             return
+        if not self.require_mutation_marker():
+            return
+        if not self.require_same_origin(mutation=True):
+            return
         self.handle_json_mutation("POST")
 
     def do_PUT(self):
         if not self.require_authentication():
             return
+        if not self.require_mutation_marker():
+            return
+        if not self.require_same_origin(mutation=True):
+            return
         self.handle_json_mutation("PUT")
 
     def do_DELETE(self):
         if not self.require_authentication():
+            return
+        if not self.require_mutation_marker():
+            return
+        if not self.require_same_origin(mutation=True):
             return
         self.handle_json_mutation("DELETE")
 
@@ -2018,7 +2537,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/recordings":
                 send_json(self, 200, {"recordings": list_recordings()})
             elif parsed.path == "/api/logs":
-                send_json(self, 200, {"logs": recent_logs((query.get("sourceId") or [None])[0], (query.get("limit") or [160])[0])})
+                config = load_config()
+                rows = recent_logs((query.get("sourceId") or [None])[0], (query.get("limit") or [160])[0])
+                send_json(self, 200, {"logs": public_log_rows(rows, config)})
             elif parsed.path == "/api/local-devices":
                 send_json(self, 200, local_devices())
             elif preview_match:
@@ -2026,7 +2547,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 send_error_json(self, 404, "Rota nao encontrada.")
         except Exception as exc:
-            send_error_json(self, 500, str(exc))
+            add_log(None, "error", f"Falha na API GET: {exc}")
+            send_error_json(self, 500, "Erro interno do servidor.")
 
     def handle_json_mutation(self, method):
         parsed = urlparse(self.path)
@@ -2034,12 +2556,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = read_json(self) if method in ("POST", "PUT") else {}
             if parsed.path == "/api/config" and method == "POST":
                 current = load_config()
-                incoming = dict(payload or {})
-                incoming_settings = dict(incoming.get("settings") or {})
-                if "webPassword" not in incoming_settings and "webPasswordHash" not in incoming_settings:
-                    incoming_settings["webPassword"] = current["settings"].get("webPassword", "")
-                incoming["settings"] = incoming_settings
-                config = save_config(incoming)
+                incoming = prepare_config_update(current, payload)
+                candidate = normalize_config(incoming)
+                validate_web_access_config(
+                    candidate,
+                    self.server.server_address[0],
+                    getattr(self.server, "is_tls", False),
+                    getattr(self.server, "allow_insecure_http", False),
+                )
+                config = save_config(candidate)
                 send_json(self, 200, {"config": public_config(config)})
                 return
 
@@ -2052,7 +2577,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 validate_camera(camera, config)
                 config["cameras"].append(camera)
                 saved = save_config(config)
-                send_json(self, 201, {"camera": saved["cameras"][-1], "config": public_config(saved)})
+                visible = public_config(saved)
+                send_json(self, 201, {"camera": find_camera(visible, camera["id"]), "config": visible})
                 return
 
             camera_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_-]+)", parsed.path)
@@ -2063,11 +2589,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not camera:
                     send_error_json(self, 404, "Camera nao encontrada.")
                     return
-                updated = normalize_cameras([{**camera, **payload, "id": camera_id, "updatedAt": now_iso()}])[0]
+                incoming_camera = dict(payload or {})
+                preserve_secret_fields(camera, incoming_camera, CAMERA_SECRET_KEYS)
+                old_url = str(camera.get("url") or "")
+                new_url = str(incoming_camera.get("url") or "")
+                if old_url and (
+                    not new_url
+                    or (url_has_credentials(old_url) and new_url in (strip_url_credentials(old_url), redact_url(old_url)))
+                ):
+                    incoming_camera["url"] = old_url
+                incoming_camera.pop("urlCredentialsConfigured", None)
+                incoming_camera.pop("urlConfigured", None)
+                updated = normalize_cameras([{**camera, **incoming_camera, "id": camera_id, "updatedAt": now_iso()}])[0]
                 validate_camera(updated, config)
                 config["cameras"] = [updated if item["id"] == camera_id else item for item in config["cameras"]]
                 saved = save_config(config)
-                send_json(self, 200, {"camera": updated, "config": public_config(saved)})
+                visible = public_config(saved)
+                send_json(self, 200, {"camera": find_camera(visible, camera_id), "config": visible})
                 return
 
             if camera_match and method == "DELETE":
@@ -2100,7 +2638,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc:
             send_error_json(self, 400, f"JSON invalido: {exc}")
         except Exception as exc:
-            send_error_json(self, 500, str(exc))
+            add_log(None, "error", f"Falha na API mutavel: {exc}")
+            send_error_json(self, 500, "Erro interno do servidor.")
 
     def serve_static(self, raw_path):
         path = unquote(raw_path).split("?", 1)[0]
@@ -2109,7 +2648,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         relative = Path(path.lstrip("/"))
         target = (WEB_DIR / relative).resolve()
         if WEB_DIR.resolve() not in target.parents and target != WEB_DIR.resolve():
-            self.send_error(403)
+            send_error_json(self, 403, "Acesso negado.")
             return
         if not target.exists() or not target.is_file():
             target = WEB_DIR / "index.html"
@@ -2119,6 +2658,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
+        send_security_headers(self)
         self.end_headers()
         self.wfile.write(content)
 
@@ -2129,8 +2669,20 @@ def validate_camera(camera, config=None):
     if camera.get("type") == "stream":
         if not camera.get("url"):
             raise ValueError("Informe a URL do stream.")
-        if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", camera["url"]):
+        if "\r" in camera["url"] or "\n" in camera["url"]:
+            raise ValueError("A URL do stream contem caracteres invalidos.")
+        try:
+            parsed = urlparse(camera["url"])
+            scheme = parsed.scheme.lower()
+            hostname = parsed.hostname
+        except ValueError as exc:
+            raise ValueError("A URL do stream e invalida.") from exc
+        if not scheme:
             raise ValueError("A URL precisa incluir o protocolo, por exemplo rtsp://.")
+        if scheme not in ALLOWED_STREAM_SCHEMES:
+            raise ValueError(f"Protocolo de stream nao permitido: {scheme}.")
+        if not hostname:
+            raise ValueError("A URL do stream precisa informar um host de rede.")
     elif camera.get("type") == "cloud-p2p":
         effective, _settings, group = resolve_camera_runtime(camera, config or {})
         if camera.get("groupId") and not group:
@@ -2141,6 +2693,10 @@ def validate_camera(camera, config=None):
             raise ValueError("Informe o ID do dispositivo P2P no grupo Cloud/P2P.")
         if not effective.get("rtspPath"):
             raise ValueError("Informe o caminho RTSP.")
+        if not str(effective.get("rtspPath")).startswith("/") or "://" in str(effective.get("rtspPath")):
+            raise ValueError("O caminho RTSP deve iniciar com / e nao pode conter outra URL.")
+        if "\r" in str(effective.get("rtspPath")) or "\n" in str(effective.get("rtspPath")):
+            raise ValueError("O caminho RTSP contem caracteres invalidos.")
     elif not camera.get("videoDevice"):
         raise ValueError("Informe o dispositivo de video Linux.")
 
@@ -2148,6 +2704,20 @@ def validate_camera(camera, config=None):
 class RecorderServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    is_tls = False
+    allow_insecure_http = False
+
+
+def validate_web_access_config(config, host, is_tls=False, allow_insecure_http=False):
+    if is_loopback_host(host):
+        return
+    if not config.get("settings", {}).get("webPassword"):
+        raise ValueError("Defina uma senha web antes de escutar em um endereco nao local.")
+    if not is_tls and not allow_insecure_http:
+        raise ValueError(
+            "HTTP sem TLS em endereco nao local foi bloqueado. Use um proxy HTTPS em 127.0.0.1, "
+            "configure --tls-cert/--tls-key ou confirme o risco com --allow-insecure-http."
+        )
 
 
 def stop_all_jobs():
@@ -2162,12 +2732,34 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--host", default=os.environ.get("CAMERA_RECORDER_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("CAMERA_RECORDER_PORT", "8088")))
+    parser.add_argument("--tls-cert", default=os.environ.get("CAMERA_RECORDER_TLS_CERT", ""))
+    parser.add_argument("--tls-key", default=os.environ.get("CAMERA_RECORDER_TLS_KEY", ""))
+    parser.add_argument(
+        "--allow-insecure-http",
+        action="store_true",
+        default=environment_flag("CAMERA_RECORDER_ALLOW_INSECURE_HTTP"),
+        help="permite HTTP sem TLS fora do loopback (nao recomendado)",
+    )
     args = parser.parse_args(argv)
 
-    load_config()
+    if bool(args.tls_cert) != bool(args.tls_key):
+        parser.error("--tls-cert e --tls-key devem ser informados juntos.")
+    config = load_config()
+    try:
+        validate_web_access_config(config, args.host, bool(args.tls_cert), args.allow_insecure_http)
+    except ValueError as exc:
+        parser.error(str(exc))
     server = RecorderServer((args.host, args.port), RequestHandler)
-    add_log(None, "info", f"Servidor iniciado em http://{args.host}:{args.port}")
-    print(f"{APP_NAME} {VERSION} em http://{args.host}:{args.port}")
+    server.allow_insecure_http = args.allow_insecure_http
+    if args.tls_cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        server.is_tls = True
+    scheme = "https" if server.is_tls else "http"
+    add_log(None, "info", f"Servidor iniciado em {scheme}://{args.host}:{args.port}")
+    print(f"{APP_NAME} {VERSION} em {scheme}://{args.host}:{args.port}")
     print(f"Configuracao: {CONFIG_PATH}")
     try:
         server.serve_forever()
@@ -2175,6 +2767,7 @@ def main(argv=None):
         print("\nEncerrando...")
     finally:
         server.shutdown()
+        server.server_close()
         stop_all_jobs()
 
 
