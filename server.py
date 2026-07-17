@@ -62,6 +62,9 @@ AUTH_BLOCK_SECONDS = 15 * 60
 DEFAULT_MAX_PREVIEWS = 8
 DEFAULT_MAX_PREVIEWS_PER_CLIENT = 8
 DEFAULT_PREVIEW_MAX_SECONDS = 30 * 60
+DEFAULT_PREVIEW_START_TIMEOUT_SECONDS = 15
+DEFAULT_PREVIEW_RTSP_ATTEMPTS = 3
+DEFAULT_PREVIEW_RTSP_RETRY_SECONDS = 2
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; "
@@ -1430,17 +1433,26 @@ def build_preview_command(camera, settings):
     return args
 
 
-def preview_log_reader(camera_id, pipe):
+def is_rtsp_service_unavailable(line):
+    return bool(re.search(r"\bmethod\s+OPTIONS\s+failed:\s*503\b", str(line or ""), re.IGNORECASE))
+
+
+def preview_log_reader(camera_id, pipe, state=None):
     if not pipe:
         return
     try:
         for raw in iter(pipe.readline, b""):
             line = raw.decode("utf-8", "replace").strip()
             if line:
+                if state is not None and is_rtsp_service_unavailable(line):
+                    state["rtspServiceUnavailable"] = True
                 level = "error" if "error" in line.lower() or "failed" in line.lower() else "ffmpeg"
                 add_log(camera_id, level, line)
     except Exception:
         return
+    finally:
+        if state is not None:
+            state["done"].set()
 
 
 def terminate_preview_process(proc):
@@ -1459,9 +1471,20 @@ def terminate_preview_process(proc):
             pass
 
 
-def write_mjpeg_frames(handler, proc):
+def send_preview_headers(handler, max_seconds):
+    handler.send_response(200)
+    handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("X-Preview-Max-Seconds", str(max_seconds))
+    send_security_headers(handler)
+    handler.end_headers()
+
+
+def write_mjpeg_frames(handler, proc, on_first_frame=None):
     buffer = bytearray()
-    while proc.poll() is None:
+    frame_count = 0
+    while True:
         chunk = proc.stdout.read(8192) if proc.stdout else b""
         if not chunk:
             break
@@ -1479,6 +1502,8 @@ def write_mjpeg_frames(handler, proc):
                 break
             frame = bytes(buffer[start : end + 2])
             del buffer[: end + 2]
+            if frame_count == 0 and on_first_frame:
+                on_first_frame()
             header = (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
@@ -1488,9 +1513,15 @@ def write_mjpeg_frames(handler, proc):
             handler.wfile.write(frame)
             handler.wfile.write(b"\r\n")
             handler.wfile.flush()
+            frame_count += 1
+    return frame_count
 
 
 class PreviewLimitError(RuntimeError):
+    pass
+
+
+class PreviewSourceUnavailableError(RuntimeError):
     pass
 
 
@@ -1555,27 +1586,84 @@ def stream_preview(handler, camera_id):
         command = build_preview_command(effective_camera, effective_settings)
         add_log(camera_id, "info", f"Preview iniciado: {camera.get('name')}")
         add_log(camera_id, "debug", " ".join(redact_url(part) for part in command))
-        proc = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
+        attempts = environment_int(
+            "CAMERA_RECORDER_PREVIEW_RTSP_ATTEMPTS",
+            DEFAULT_PREVIEW_RTSP_ATTEMPTS,
+            1,
+            5,
         )
-        if proc.stderr:
-            threading.Thread(target=preview_log_reader, args=(camera_id, proc.stderr), daemon=True).start()
-        timer = threading.Timer(max_seconds, terminate_preview_process, args=(proc,))
-        timer.daemon = True
-        timer.start()
-        handler.send_response(200)
-        handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        handler.send_header("Pragma", "no-cache")
-        handler.send_header("X-Preview-Max-Seconds", str(max_seconds))
-        send_security_headers(handler)
-        handler.end_headers()
-        response_started = True
-        write_mjpeg_frames(handler, proc)
+        retry_seconds = environment_int(
+            "CAMERA_RECORDER_PREVIEW_RTSP_RETRY_SECONDS",
+            DEFAULT_PREVIEW_RTSP_RETRY_SECONDS,
+            1,
+            10,
+        )
+        start_timeout = environment_int(
+            "CAMERA_RECORDER_PREVIEW_START_TIMEOUT_SECONDS",
+            DEFAULT_PREVIEW_START_TIMEOUT_SECONDS,
+            3,
+            60,
+        )
+        preview_deadline = time.monotonic() + max_seconds
+        last_rtsp_unavailable = False
+
+        for attempt in range(1, attempts + 1):
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            log_state = {"rtspServiceUnavailable": False, "done": threading.Event()}
+            log_thread = None
+            if proc.stderr:
+                log_thread = threading.Thread(
+                    target=preview_log_reader,
+                    args=(camera_id, proc.stderr, log_state),
+                    daemon=True,
+                )
+                log_thread.start()
+
+            timer = threading.Timer(start_timeout, terminate_preview_process, args=(proc,))
+            timer.daemon = True
+            timer.start()
+
+            def begin_response():
+                nonlocal response_started, timer
+                if response_started:
+                    return
+                timer.cancel()
+                send_preview_headers(handler, max_seconds)
+                response_started = True
+                remaining = max(0.1, preview_deadline - time.monotonic())
+                timer = threading.Timer(remaining, terminate_preview_process, args=(proc,))
+                timer.daemon = True
+                timer.start()
+
+            frame_count = write_mjpeg_frames(handler, proc, begin_response)
+            timer.cancel()
+            terminate_preview_process(proc)
+            if log_thread:
+                log_thread.join(timeout=1)
+            last_rtsp_unavailable = bool(log_state["rtspServiceUnavailable"])
+
+            if frame_count > 0 or response_started:
+                break
+            if not last_rtsp_unavailable or attempt >= attempts:
+                break
+            add_log(
+                camera_id,
+                "warning",
+                f"RTSP respondeu 503; nova tentativa no mesmo tunel em {retry_seconds}s "
+                f"({attempt}/{attempts}).",
+            )
+            time.sleep(retry_seconds)
+
+        if not response_started:
+            if last_rtsp_unavailable:
+                raise PreviewSourceUnavailableError("RTSP respondeu 503 apos tentativas limitadas.")
+            raise PreviewSourceUnavailableError("FFmpeg nao produziu imagens para o preview.")
     except PreviewLimitError as exc:
         send_error_json(handler, 429, str(exc), {"Retry-After": "5"})
     except T2uBackoffError as exc:
@@ -1583,6 +1671,10 @@ def stream_preview(handler, camera_id):
     except T2uTunnelUnavailableError as exc:
         add_log(camera_id, "warning", f"Tunel P2P temporariamente indisponivel: {exc}")
         send_error_json(handler, 503, "Tunel P2P temporariamente indisponivel.", {"Retry-After": "5"})
+    except PreviewSourceUnavailableError as exc:
+        add_log(camera_id, "warning", f"Fonte do preview temporariamente indisponivel: {exc}")
+        if not response_started:
+            send_error_json(handler, 503, "Fonte RTSP temporariamente indisponivel.", {"Retry-After": "5"})
     except ValueError as exc:
         send_error_json(handler, 400, str(exc))
     except FileNotFoundError as exc:

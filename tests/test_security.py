@@ -1,5 +1,6 @@
 import base64
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -227,6 +228,96 @@ class SecurityHelpersTest(unittest.TestCase):
         self.assertEqual(runtime._dll.added, [12000, 12001])
         self.assertEqual(runtime._dll.deleted, [12000])
         tunnel.close()
+
+    def test_rtsp_service_unavailable_detection_is_specific(self):
+        self.assertTrue(
+            server.is_rtsp_service_unavailable(
+                "[rtsp @ 0x1234] method OPTIONS failed: 503 Service Unavailable"
+            )
+        )
+        self.assertFalse(server.is_rtsp_service_unavailable("method DESCRIBE failed: 503 Service Unavailable"))
+        self.assertFalse(server.is_rtsp_service_unavailable("method OPTIONS failed: 401 Unauthorized"))
+
+    def test_preview_retries_rtsp_503_on_the_same_tunnel(self):
+        class FakeProcess:
+            def __init__(self, stdout, stderr, returncode):
+                self.stdout = io.BytesIO(stdout)
+                self.stderr = io.BytesIO(stderr)
+                self.returncode = returncode
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        class FakeTunnel:
+            local_port = 12000
+            reused = False
+            use_count = 1
+
+            def close(self):
+                return {"closed": True, "localPort": self.local_port}
+
+        class FakeHandler:
+            def __init__(self):
+                self.statuses = []
+                self.headers = []
+                self.wfile = io.BytesIO()
+                self.server = type("FakeServer", (), {"is_tls": False})()
+
+            def client_ip(self):
+                return "192.0.2.40"
+
+            def send_response(self, status):
+                self.statuses.append(status)
+
+            def send_header(self, name, value):
+                self.headers.append((name, value))
+
+            def end_headers(self):
+                pass
+
+        camera = {
+            "id": "camera-1",
+            "name": "Camera 1",
+            "type": "cloud-p2p",
+            "enabled": True,
+        }
+        prepared = {
+            "id": "camera-1",
+            "name": "Camera 1",
+            "type": "stream",
+            "url": "rtsp://127.0.0.1:12000/live",
+        }
+        first = FakeProcess(
+            b"",
+            b"[rtsp @ 0x1234] method OPTIONS failed: 503 Service Unavailable\n",
+            1,
+        )
+        second = FakeProcess(b"\xff\xd8jpeg\xff\xd9", b"", 0)
+        handler = FakeHandler()
+        tunnel = FakeTunnel()
+
+        with mock.patch.object(server, "load_config", return_value=self.config), mock.patch.object(
+            server, "find_camera", return_value=camera
+        ), mock.patch.object(server, "validate_camera"), mock.patch.object(
+            server, "prepare_camera_input", return_value=(prepared, self.config["settings"], tunnel)
+        ), mock.patch.object(
+            server, "build_preview_command", return_value=["ffmpeg"]
+        ), mock.patch.object(
+            server.subprocess, "Popen", side_effect=[first, second]
+        ) as popen, mock.patch.object(
+            server.time, "sleep"
+        ) as sleep, mock.patch.object(
+            server, "add_log"
+        ):
+            server.stream_preview(handler, "camera-1")
+
+        self.assertEqual(popen.call_count, 2)
+        sleep.assert_called_once_with(server.DEFAULT_PREVIEW_RTSP_RETRY_SECONDS)
+        self.assertEqual(handler.statuses, [200])
+        self.assertIn(b"\xff\xd8jpeg\xff\xd9", handler.wfile.getvalue())
 
 
 class SecurityHttpTest(unittest.TestCase):
