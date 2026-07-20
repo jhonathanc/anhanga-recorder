@@ -30,7 +30,7 @@ WEB_DIR = APP_DIR / "web"
 APP_NAME = "Anhangá Recorder"
 DATA_DIR = Path(os.environ.get("CAMERA_RECORDER_DATA_DIR", APP_DIR / "data")).resolve()
 CONFIG_PATH = DATA_DIR / "config.json"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_T2U_DLL = "../Libt2u Win32 SDK/libt2u.dll" if os.name == "nt" else "./native/libt2u.so"
 T2U_SETTING_KEYS = (
     "t2uDllPath",
@@ -65,6 +65,9 @@ DEFAULT_PREVIEW_MAX_SECONDS = 30 * 60
 DEFAULT_PREVIEW_START_TIMEOUT_SECONDS = 15
 DEFAULT_PREVIEW_RTSP_ATTEMPTS = 3
 DEFAULT_PREVIEW_RTSP_RETRY_SECONDS = 2
+DEFAULT_MAX_DOWNLOADS = 4
+RECORDING_EXTENSIONS = frozenset((".avi", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"))
+RECORDING_NAME_PATTERN = re.compile(r"_(\d{8})_(\d{6})(?:\.[^.]+)$")
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; "
@@ -112,6 +115,7 @@ JOBS = {}
 LOGS = []
 AUTH_FAILURES = {}
 ACTIVE_PREVIEWS = {}
+DOWNLOAD_SLOTS = threading.BoundedSemaphore(DEFAULT_MAX_DOWNLOADS)
 PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 120000
 PASSWORD_MAX_LENGTH = 50
@@ -2252,32 +2256,277 @@ def disk_status(settings):
         return {"path": str(output), "error": str(exc)}
 
 
-def list_recordings(limit=500):
-    settings = load_config()["settings"]
-    output = resolve_user_path(settings.get("outputDir"))
+def path_is_within(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def recording_timestamp(path, stat):
+    match = RECORDING_NAME_PATTERN.search(path.name)
+    if match:
+        compact_date, compact_time = match.groups()
+        try:
+            time.strptime(compact_date + compact_time, "%Y%m%d%H%M%S")
+            return (
+                f"{compact_date[:4]}-{compact_date[4:6]}-{compact_date[6:]}",
+                f"{compact_time[:2]}:{compact_time[2:4]}:{compact_time[4:]}",
+            )
+        except ValueError:
+            pass
+    try:
+        time.strptime(path.parent.name, "%Y-%m-%d")
+        day = path.parent.name
+    except ValueError:
+        day = time.strftime("%Y-%m-%d", time.localtime(stat.st_mtime))
+    return day, time.strftime("%H:%M:%S", time.localtime(stat.st_mtime))
+
+
+def recording_camera_names(config):
+    names = {}
+    for camera in (config or {}).get("cameras", []):
+        folder = safe_name(camera.get("name"))
+        names.setdefault(folder, {"id": camera.get("id"), "name": camera.get("name") or folder})
+    return names
+
+
+def iter_recordings(config=None):
+    config = config or load_config()
+    output = resolve_user_path(config["settings"].get("outputDir"))
     if not output.exists():
-        return []
-    files = []
+        return
+    output = output.resolve()
+    camera_names = recording_camera_names(config)
     for path in output.rglob("*"):
-        if not path.is_file():
-            continue
         try:
             relative = path.relative_to(output)
-            if any(part.startswith(".") for part in relative.parts):
+            if (
+                not path.is_file()
+                or path.suffix.lower() not in RECORDING_EXTENSIONS
+                or any(not part or part.startswith(".") for part in relative.parts)
+            ):
+                continue
+            resolved = path.resolve()
+            if not path_is_within(resolved, output):
                 continue
             stat = path.stat()
-            files.append(
-                {
-                    "name": path.name,
-                    "relativePath": str(relative),
-                    "size": stat.st_size,
-                    "modified": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
-                }
-            )
+            day, recorded_time = recording_timestamp(path, stat)
+            camera_key = relative.parts[0] if len(relative.parts) > 1 else "recordings"
+            camera = camera_names.get(camera_key, {})
+            yield {
+                "name": path.name,
+                "relativePath": relative.as_posix(),
+                "size": stat.st_size,
+                "modified": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
+                "date": day,
+                "time": recorded_time,
+                "cameraKey": camera_key,
+                "cameraId": camera.get("id"),
+                "cameraName": camera.get("name") or camera_key,
+            }
         except OSError:
             continue
+
+
+def list_recordings(limit=500):
+    files = list(iter_recordings())
     files.sort(key=lambda item: item["modified"], reverse=True)
     return files[:limit]
+
+
+def validate_recording_date(value):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("Data de gravacao invalida.")
+    try:
+        time.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("Data de gravacao invalida.") from exc
+    return value
+
+
+def validate_recording_camera_key(value):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", value):
+        raise ValueError("Camera de gravacao invalida.")
+    return value
+
+
+def recording_catalog(selected_date=None, selected_camera=None, file_limit=2000):
+    selected_date = validate_recording_date(selected_date)
+    selected_camera = validate_recording_camera_key(selected_camera)
+    date_stats = {}
+    camera_stats = {}
+    selected_day_files = []
+    latest_date = None
+
+    for item in iter_recordings():
+        day = item["date"]
+        camera_key = item["cameraKey"]
+        day_stat = date_stats.setdefault(day, {"fileCount": 0, "totalSize": 0, "cameras": set()})
+        day_stat["fileCount"] += 1
+        day_stat["totalSize"] += item["size"]
+        day_stat["cameras"].add(camera_key)
+
+        camera_stat = camera_stats.setdefault(
+            (day, camera_key),
+            {
+                "key": camera_key,
+                "id": item.get("cameraId"),
+                "name": item.get("cameraName") or camera_key,
+                "fileCount": 0,
+                "totalSize": 0,
+            },
+        )
+        camera_stat["fileCount"] += 1
+        camera_stat["totalSize"] += item["size"]
+
+        if selected_date:
+            if day == selected_date:
+                selected_day_files.append(item)
+        elif latest_date is None or day > latest_date:
+            latest_date = day
+            selected_day_files = [item]
+        elif day == latest_date:
+            selected_day_files.append(item)
+
+    if selected_date is None:
+        selected_date = latest_date
+
+    dates = [
+        {
+            "date": day,
+            "fileCount": stats["fileCount"],
+            "cameraCount": len(stats["cameras"]),
+            "totalSize": stats["totalSize"],
+        }
+        for day, stats in date_stats.items()
+    ]
+    dates.sort(key=lambda item: item["date"], reverse=True)
+
+    cameras = [dict(stats) for (day, _key), stats in camera_stats.items() if day == selected_date]
+    cameras.sort(key=lambda item: (str(item["name"]).casefold(), item["key"]))
+    if selected_camera is None and cameras:
+        selected_camera = cameras[0]["key"]
+
+    files = [item for item in selected_day_files if item["cameraKey"] == selected_camera]
+    files.sort(key=lambda item: (item["date"], item["time"], item["modified"]), reverse=True)
+    limit = max(1, min(5000, int(file_limit or 2000)))
+    return {
+        "dates": dates,
+        "cameras": cameras,
+        "recordings": files[:limit],
+        "selectedDate": selected_date,
+        "selectedCamera": selected_camera,
+        "truncated": len(files) > limit,
+    }
+
+
+def resolve_recording_file(relative_value):
+    raw = str(relative_value or "").strip()
+    if not raw or len(raw) > 1024 or "\0" in raw:
+        raise FileNotFoundError("Gravacao nao encontrada.")
+    parts = raw.replace("\\", "/").split("/")
+    if any(not part or part in (".", "..") or part.startswith(".") for part in parts):
+        raise FileNotFoundError("Gravacao nao encontrada.")
+
+    output = resolve_user_path(load_config()["settings"].get("outputDir")).resolve(strict=True)
+    candidate = output.joinpath(*parts).resolve(strict=True)
+    if (
+        not path_is_within(candidate, output)
+        or not candidate.is_file()
+        or candidate.suffix.lower() not in RECORDING_EXTENSIONS
+    ):
+        raise FileNotFoundError("Gravacao nao encontrada.")
+    return candidate
+
+
+def parse_byte_range(value, size):
+    value = str(value or "").strip()
+    if not value:
+        return 0, max(-1, size - 1), False
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value)
+    if not match or size <= 0:
+        raise ValueError("Faixa de bytes invalida.")
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise ValueError("Faixa de bytes invalida.")
+    if not start_text:
+        suffix = int(end_text)
+        if suffix <= 0:
+            raise ValueError("Faixa de bytes invalida.")
+        start = max(0, size - suffix)
+        end = size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+        if start >= size or end < start:
+            raise ValueError("Faixa de bytes invalida.")
+        end = min(end, size - 1)
+    return start, end, True
+
+
+def send_recording_file(handler, relative_value):
+    try:
+        path = resolve_recording_file(relative_value)
+    except (FileNotFoundError, OSError):
+        send_error_json(handler, 404, "Gravacao nao encontrada.")
+        return
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        send_error_json(handler, 404, "Gravacao nao encontrada.")
+        return
+
+    if not DOWNLOAD_SLOTS.acquire(blocking=False):
+        send_error_json(handler, 503, "Limite de downloads simultaneos atingido.", {"Retry-After": "5"})
+        return
+    try:
+        try:
+            start, end, partial = parse_byte_range(handler.headers.get("Range"), size)
+        except ValueError:
+            send_error_json(
+                handler,
+                416,
+                "Faixa de bytes invalida.",
+                {"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
+            )
+            return
+
+        length = max(0, end - start + 1)
+        fallback = safe_name(path.stem) + path.suffix.lower()
+        disposition = f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(path.name, safe='')}"
+        handler.send_response(206 if partial else 200)
+        handler.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        handler.send_header("Content-Length", str(length))
+        handler.send_header("Content-Disposition", disposition)
+        handler.send_header("Accept-Ranges", "bytes")
+        handler.send_header("Cache-Control", "private, no-cache")
+        if partial:
+            handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        send_security_headers(handler)
+        handler.end_headers()
+
+        with path.open("rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                handler.wfile.write(chunk)
+                remaining -= len(chunk)
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+        pass
+    finally:
+        DOWNLOAD_SLOTS.release()
 
 
 def recent_logs(source_id=None, limit=160):
@@ -2626,8 +2875,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             preview_match = re.fullmatch(r"/api/preview/([A-Za-z0-9_-]+)\.mjpg", parsed.path)
             if parsed.path == "/api/state":
                 send_json(self, 200, state_payload())
+            elif parsed.path == "/api/recordings/download":
+                send_recording_file(self, (query.get("path") or [""])[0])
             elif parsed.path == "/api/recordings":
-                send_json(self, 200, {"recordings": list_recordings()})
+                try:
+                    payload = recording_catalog(
+                        (query.get("date") or [None])[0],
+                        (query.get("camera") or [None])[0],
+                    )
+                except ValueError as exc:
+                    send_error_json(self, 400, str(exc))
+                    return
+                send_json(self, 200, payload)
             elif parsed.path == "/api/logs":
                 config = load_config()
                 rows = recent_logs((query.get("sourceId") or [None])[0], (query.get("limit") or [160])[0])

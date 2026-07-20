@@ -6,6 +6,7 @@ Aplicacao local acessada pelo navegador para gravar em disco cameras ou entradas
 
 - Grava todas as fontes cadastradas ou apenas as selecionadas.
 - Usa `-c copy` no FFmpeg para preservar a qualidade original de video/audio, sem recompressao.
+- Organiza as gravacoes em um calendario por data e camera, com download autenticado e retomada por faixa de bytes.
 - Segmenta a gravacao em arquivos `.mkv`, por fonte e por data.
 - Reinicia streams automaticamente quando uma conexao cai.
 - Permite cadastrar URLs de rede RTSP, HTTP/HTTPS, RTMP/RTMPS, SRT, UDP ou TCP. Protocolos de arquivo e entrada local via URL sao bloqueados.

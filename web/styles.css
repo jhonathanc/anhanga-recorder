@@ -368,18 +368,213 @@ select:focus {
   overflow: auto;
 }
 
+.recording-browser {
+  display: grid;
+  grid-template-columns: 238px minmax(0, 1fr);
+  gap: 18px;
+  min-height: 360px;
+}
+
+.recording-browser[aria-busy="true"] {
+  opacity: 0.72;
+}
+
+.recording-calendar {
+  min-width: 0;
+  padding-right: 18px;
+  border-right: 1px solid var(--line);
+}
+
+.calendar-heading {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 36px;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.calendar-heading strong {
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+button.icon-button {
+  width: 36px;
+  min-height: 36px;
+  padding: 0;
+  font-size: 24px;
+  line-height: 1;
+}
+
+.calendar-weekdays,
+.calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 3px;
+}
+
+.calendar-weekdays {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.calendar-day,
+.calendar-empty {
+  aspect-ratio: 1;
+  min-width: 0;
+  min-height: 29px;
+}
+
+.calendar-day {
+  position: relative;
+  border-color: transparent;
+  border-radius: 4px;
+  padding: 0;
+  font-size: 12px;
+}
+
+.calendar-day:disabled {
+  background: transparent;
+  color: #a7b0ba;
+  opacity: 1;
+}
+
+.calendar-day.has-recordings {
+  border-color: #9bc9c6;
+  background: #edf8f7;
+  color: #0f5f5b;
+  font-weight: 700;
+}
+
+.calendar-day.has-recordings::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  bottom: 3px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.calendar-day.today {
+  box-shadow: inset 0 0 0 1px #8b98a6;
+}
+
+.calendar-day.selected {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.calendar-day.selected::after {
+  background: #fff;
+}
+
+.recording-results {
+  min-width: 0;
+}
+
+.recording-result-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.recording-result-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.recording-camera-list {
+  display: flex;
+  gap: 6px;
+  min-height: 48px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  overflow-x: auto;
+  border-bottom: 1px solid #eef1f4;
+}
+
+button.recording-camera {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 2px;
+  min-width: 150px;
+  min-height: 46px;
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.recording-camera strong,
+.recording-camera span {
+  overflow: hidden;
+  max-width: 190px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recording-camera span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+button.recording-camera.selected {
+  border-color: var(--accent);
+  background: #edf8f7;
+  color: var(--accent-dark);
+}
+
 .recording-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 92px 150px;
+  grid-template-columns: minmax(0, 1fr) 68px 82px 66px;
   gap: 10px;
   align-items: center;
-  min-height: 38px;
+  min-height: 46px;
   border-bottom: 1px solid #eef1f4;
   font-size: 13px;
 }
 
 .recording-item:last-child {
   border-bottom: 0;
+}
+
+.download-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.download-button:hover {
+  background: #edf8f7;
+}
+
+.recording-empty {
+  padding: 18px 0;
+}
+
+.recording-notice {
+  padding: 8px;
+  border-left: 3px solid var(--warn);
+  background: #fff8e8;
+  color: #805000;
+  font-size: 12px;
 }
 
 .logs pre,
@@ -453,5 +648,27 @@ dialog form {
     grid-template-columns: 1fr;
     gap: 2px;
     padding: 8px 0;
+  }
+
+  .recording-browser {
+    grid-template-columns: 1fr;
+  }
+
+  .recording-calendar {
+    padding-right: 0;
+    padding-bottom: 14px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .recording-result-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .download-button {
+    width: 84px;
+    margin-top: 6px;
   }
 }

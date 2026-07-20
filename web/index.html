@@ -326,10 +326,30 @@
     <section class="bottom">
       <div class="panel recordings">
         <div class="section-heading">
-          <h2>Arquivos</h2>
+          <h2>Gravacoes</h2>
           <button id="refreshRecordings">Atualizar</button>
         </div>
-        <div id="recordingsList" class="recording-list"></div>
+        <div id="recordingBrowser" class="recording-browser">
+          <section class="recording-calendar" aria-label="Calendario de gravacoes">
+            <div class="calendar-heading">
+              <button id="previousRecordingMonth" class="icon-button" type="button" title="Mes anterior" aria-label="Mes anterior">&#8249;</button>
+              <strong id="recordingMonthLabel"></strong>
+              <button id="nextRecordingMonth" class="icon-button" type="button" title="Proximo mes" aria-label="Proximo mes">&#8250;</button>
+            </div>
+            <div class="calendar-weekdays" aria-hidden="true">
+              <span>Dom</span><span>Seg</span><span>Ter</span><span>Qua</span><span>Qui</span><span>Sex</span><span>Sab</span>
+            </div>
+            <div id="recordingCalendarGrid" class="calendar-grid"></div>
+          </section>
+          <section class="recording-results" aria-live="polite">
+            <div class="recording-result-heading">
+              <h3 id="recordingDateLabel">Selecione uma data</h3>
+              <span id="recordingDateSummary" class="meta"></span>
+            </div>
+            <div id="recordingCameras" class="recording-camera-list"></div>
+            <div id="recordingsList" class="recording-list"></div>
+          </section>
+        </div>
       </div>
       <div class="panel logs">
         <div class="section-heading">

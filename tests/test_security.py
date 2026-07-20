@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from unittest import mock
+from urllib.parse import quote
 
 import server
 
@@ -238,6 +239,62 @@ class SecurityHelpersTest(unittest.TestCase):
         self.assertFalse(server.is_rtsp_service_unavailable("method DESCRIBE failed: 503 Service Unavailable"))
         self.assertFalse(server.is_rtsp_service_unavailable("method OPTIONS failed: 401 Unauthorized"))
 
+    def test_recording_catalog_groups_by_segment_date_and_camera(self):
+        self.config["cameras"].append(
+            {
+                "id": "camera-2",
+                "name": "Camera 2",
+                "type": "stream",
+                "url": "rtsp://192.0.2.11/live",
+                "enabled": True,
+            }
+        )
+        output = Path(self.config["settings"]["outputDir"])
+        files = {
+            "Camera_1/2026-07-19/Camera_1_20260719_234500.mkv": b"older",
+            "Camera_1/2026-07-19/Camera_1_20260720_001500.mkv": b"after-midnight",
+            "Camera_2/2026-07-20/Camera_2_20260720_010000.mkv": b"second-camera",
+        }
+        for relative, content in files.items():
+            target = output / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+        with mock.patch.object(server, "load_config", return_value=self.config):
+            catalog = server.recording_catalog()
+            camera_two = server.recording_catalog("2026-07-20", "Camera_2")
+
+        self.assertEqual(catalog["selectedDate"], "2026-07-20")
+        self.assertEqual([item["date"] for item in catalog["dates"]], ["2026-07-20", "2026-07-19"])
+        self.assertEqual(catalog["dates"][0]["cameraCount"], 2)
+        self.assertEqual([item["name"] for item in catalog["cameras"]], ["Camera 1", "Camera 2"])
+        self.assertEqual(catalog["recordings"][0]["time"], "00:15:00")
+        self.assertEqual(camera_two["recordings"][0]["name"], "Camera_2_20260720_010000.mkv")
+
+    def test_recording_file_resolution_stays_inside_output_directory(self):
+        output = Path(self.config["settings"]["outputDir"])
+        target = output / "Camera_1" / "2026-07-20" / "Camera_1_20260720_010000.mkv"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"video")
+
+        with mock.patch.object(server, "load_config", return_value=self.config):
+            self.assertEqual(
+                server.resolve_recording_file("Camera_1/2026-07-20/Camera_1_20260720_010000.mkv"),
+                target.resolve(),
+            )
+            with self.assertRaises(FileNotFoundError):
+                server.resolve_recording_file("../outside.mkv")
+            with self.assertRaises(FileNotFoundError):
+                server.resolve_recording_file(".private/secret.mkv")
+
+    def test_byte_ranges_cover_full_open_and_suffix_forms(self):
+        self.assertEqual(server.parse_byte_range(None, 10), (0, 9, False))
+        self.assertEqual(server.parse_byte_range("bytes=2-5", 10), (2, 5, True))
+        self.assertEqual(server.parse_byte_range("bytes=7-", 10), (7, 9, True))
+        self.assertEqual(server.parse_byte_range("bytes=-3", 10), (7, 9, True))
+        with self.assertRaises(ValueError):
+            server.parse_byte_range("bytes=10-12", 10)
+
     def test_preview_retries_rtsp_503_on_the_same_tunnel(self):
         class FakeProcess:
             def __init__(self, stdout, stderr, returncode):
@@ -330,6 +387,10 @@ class SecurityHttpTest(unittest.TestCase):
         server.DATA_DIR = cls.root / "data"
         server.CONFIG_PATH = server.DATA_DIR / "config.json"
         server.save_config(sample_config(cls.root))
+        cls.recording_relative = "Camera_1/2026-07-20/Camera_1_20260720_010000.mkv"
+        recording = cls.root / "recordings" / cls.recording_relative
+        recording.parent.mkdir(parents=True, exist_ok=True)
+        recording.write_bytes(b"0123456789")
         cls.httpd = server.RecorderServer(("127.0.0.1", 0), server.RequestHandler)
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -421,6 +482,38 @@ class SecurityHttpTest(unittest.TestCase):
             self.skipTest("POSIX permissions are enforced on Linux deployments")
         self.assertEqual(server.CONFIG_PATH.stat().st_mode & 0o777, 0o600)
         self.assertEqual(server.DATA_DIR.stat().st_mode & 0o777, 0o700)
+
+    def test_recording_catalog_and_download_support_ranges(self):
+        status, _headers, body = self.request("GET", "/api/recordings")
+        self.assertEqual(status, 200)
+        catalog = json.loads(body)
+        self.assertEqual(catalog["selectedDate"], "2026-07-20")
+        self.assertEqual(catalog["selectedCamera"], "Camera_1")
+        self.assertEqual(catalog["recordings"][0]["relativePath"], self.recording_relative)
+
+        encoded = quote(self.recording_relative, safe="")
+        status, headers, body = self.request("GET", f"/api/recordings/download?path={encoded}")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"0123456789")
+        self.assertEqual(headers.get("Accept-Ranges"), "bytes")
+        self.assertIn("attachment", headers.get("Content-Disposition", ""))
+
+        status, headers, body = self.request(
+            "GET",
+            f"/api/recordings/download?path={encoded}",
+            headers={"Range": "bytes=2-5"},
+        )
+        self.assertEqual(status, 206)
+        self.assertEqual(body, b"2345")
+        self.assertEqual(headers.get("Content-Range"), "bytes 2-5/10")
+
+    def test_recording_download_rejects_path_traversal(self):
+        status, _headers, body = self.request(
+            "GET",
+            "/api/recordings/download?path=..%2Foutside.mkv",
+        )
+        self.assertEqual(status, 404)
+        self.assertIn("nao encontrada", body.decode("utf-8"))
 
 
 if __name__ == "__main__":

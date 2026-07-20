@@ -9,6 +9,14 @@ const state = {
   previewSignature: "",
   previewRunId: 0,
   previewQueueActive: false,
+  recordingDates: [],
+  recordingCameras: [],
+  recordingFiles: [],
+  recordingDate: null,
+  recordingCamera: null,
+  recordingMonth: null,
+  recordingsTruncated: false,
+  recordingsRequestId: 0,
 };
 
 const NEW_FORM = "__new__";
@@ -487,18 +495,151 @@ async function refreshState() {
   renderLogs(data.logs || []);
 }
 
-async function refreshRecordings() {
-  const data = await api("/api/recordings");
-  const rows = data.recordings || [];
-  $("recordingsList").innerHTML = rows.length
-    ? rows.map((file) => `
-        <div class="recording-item">
-          <span class="source-name"><strong>${escapeHtml(file.name)}</strong><span>${escapeHtml(file.relativePath)}</span></span>
-          <span>${fmtBytes(file.size)}</span>
-          <span>${formatTime(file.modified)}</span>
-        </div>
+function localDateFromDay(value) {
+  const parts = String(value || "").split("-").map(Number);
+  return parts.length === 3 && parts.every(Number.isFinite)
+    ? new Date(parts[0], parts[1] - 1, parts[2])
+    : null;
+}
+
+function monthValue(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function formatRecordingDate(value) {
+  const date = localDateFromDay(value);
+  const formatted = date
+    ? new Intl.DateTimeFormat("pt-BR", { weekday: "long", day: "2-digit", month: "long", year: "numeric" }).format(date)
+    : "Selecione uma data";
+  return formatted.charAt(0).toUpperCase() + formatted.slice(1);
+}
+
+function renderRecordingCalendar() {
+  const available = new Map(state.recordingDates.map((item) => [item.date, item]));
+  const selectedDate = localDateFromDay(state.recordingDate);
+  if (!state.recordingMonth) {
+    state.recordingMonth = monthValue(selectedDate || new Date());
+  }
+  const [year, month] = state.recordingMonth.split("-").map(Number);
+  const first = new Date(year, month - 1, 1);
+  const dayCount = new Date(year, month, 0).getDate();
+  const today = monthValue(new Date()) === state.recordingMonth ? new Date().getDate() : -1;
+  $("recordingMonthLabel").textContent = new Intl.DateTimeFormat("pt-BR", {
+    month: "long",
+    year: "numeric",
+  }).format(first);
+
+  const cells = [];
+  for (let index = 0; index < 42; index += 1) {
+    const day = index - first.getDay() + 1;
+    if (day < 1 || day > dayCount) {
+      cells.push(`<span class="calendar-empty" aria-hidden="true"></span>`);
+      continue;
+    }
+    const date = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    const summary = available.get(date);
+    const selected = date === state.recordingDate;
+    const classes = ["calendar-day", summary ? "has-recordings" : "", selected ? "selected" : "", day === today ? "today" : ""]
+      .filter(Boolean)
+      .join(" ");
+    const title = summary
+      ? `${summary.fileCount} arquivo${summary.fileCount === 1 ? "" : "s"}, ${summary.cameraCount} camera${summary.cameraCount === 1 ? "" : "s"}`
+      : "Sem gravacoes";
+    cells.push(`
+      <button class="${classes}" type="button" data-recording-date="${date}" title="${escapeHtml(title)}"
+        aria-pressed="${selected ? "true" : "false"}" ${summary ? "" : "disabled"}>${day}</button>
+    `);
+  }
+  $("recordingCalendarGrid").innerHTML = cells.join("");
+}
+
+function renderRecordingCameras() {
+  const dateSummary = state.recordingDates.find((item) => item.date === state.recordingDate);
+  $("recordingDateLabel").textContent = formatRecordingDate(state.recordingDate);
+  $("recordingDateSummary").textContent = dateSummary
+    ? `${dateSummary.fileCount} arquivo${dateSummary.fileCount === 1 ? "" : "s"} em ${dateSummary.cameraCount} camera${dateSummary.cameraCount === 1 ? "" : "s"}`
+    : "";
+  $("recordingCameras").innerHTML = state.recordingCameras.length
+    ? state.recordingCameras.map((camera) => `
+        <button type="button" class="recording-camera ${camera.key === state.recordingCamera ? "selected" : ""}"
+          data-recording-camera="${escapeHtml(camera.key)}" aria-pressed="${camera.key === state.recordingCamera ? "true" : "false"}">
+          <strong>${escapeHtml(camera.name)}</strong>
+          <span>${camera.fileCount} arquivo${camera.fileCount === 1 ? "" : "s"} · ${fmtBytes(camera.totalSize)}</span>
+        </button>
       `).join("")
-    : `<div class="meta">Nenhuma gravacao encontrada.</div>`;
+    : `<div class="meta">Nenhuma camera com gravacao nesta data.</div>`;
+}
+
+function renderRecordingFiles() {
+  const rows = state.recordingFiles;
+  const truncated = state.recordingsTruncated
+    ? `<div class="recording-notice">A lista foi limitada aos arquivos mais recentes.</div>`
+    : "";
+  $("recordingsList").innerHTML = rows.length
+    ? truncated + rows.map((file) => {
+        const href = `/api/recordings/download?path=${encodeURIComponent(file.relativePath)}`;
+        return `
+          <div class="recording-item">
+            <span class="source-name"><strong>${escapeHtml(file.name)}</strong><span>${escapeHtml(file.relativePath)}</span></span>
+            <time datetime="${escapeHtml(`${file.date}T${file.time}`)}">${escapeHtml(file.time)}</time>
+            <span>${fmtBytes(file.size)}</span>
+            <a class="download-button" href="${href}" download>Baixar</a>
+          </div>
+        `;
+      }).join("")
+    : `<div class="meta recording-empty">${state.recordingDate ? "Nenhum arquivo para esta camera." : "Nenhuma gravacao encontrada."}</div>`;
+}
+
+function renderRecordings() {
+  renderRecordingCalendar();
+  renderRecordingCameras();
+  renderRecordingFiles();
+}
+
+async function refreshRecordings() {
+  const requestId = ++state.recordingsRequestId;
+  const query = new URLSearchParams();
+  if (state.recordingDate) query.set("date", state.recordingDate);
+  if (state.recordingCamera) query.set("camera", state.recordingCamera);
+  const queryString = query.toString();
+  $("recordingBrowser").setAttribute("aria-busy", "true");
+  try {
+    const data = await api(`/api/recordings${queryString ? `?${queryString}` : ""}`);
+    if (requestId !== state.recordingsRequestId) return;
+    state.recordingDates = data.dates || [];
+    state.recordingCameras = data.cameras || [];
+    state.recordingFiles = data.recordings || [];
+    state.recordingDate = data.selectedDate || state.recordingDate;
+    state.recordingCamera = data.selectedCamera || null;
+    state.recordingsTruncated = Boolean(data.truncated);
+    if (!state.recordingMonth) {
+      const selected = localDateFromDay(state.recordingDate);
+      state.recordingMonth = monthValue(selected || new Date());
+    }
+    renderRecordings();
+  } finally {
+    if (requestId === state.recordingsRequestId) {
+      $("recordingBrowser").removeAttribute("aria-busy");
+    }
+  }
+}
+
+function changeRecordingMonth(offset) {
+  const [year, month] = (state.recordingMonth || monthValue(new Date())).split("-").map(Number);
+  state.recordingMonth = monthValue(new Date(year, month - 1 + offset, 1));
+  renderRecordingCalendar();
+}
+
+function selectRecordingDate(value) {
+  state.recordingDate = value;
+  state.recordingCamera = null;
+  state.recordingMonth = value.slice(0, 7);
+  refreshRecordings().catch((error) => { $("systemLine").textContent = error.message; });
+}
+
+function selectRecordingCamera(value) {
+  state.recordingCamera = value;
+  refreshRecordings().catch((error) => { $("systemLine").textContent = error.message; });
 }
 
 function formCamera() {
@@ -820,6 +961,16 @@ function wireEvents() {
   $("buildRtsp").addEventListener("click", buildRtspUrl);
   $("probeSource").addEventListener("click", probeCurrent);
   $("refreshRecordings").addEventListener("click", refreshRecordings);
+  $("previousRecordingMonth").addEventListener("click", () => changeRecordingMonth(-1));
+  $("nextRecordingMonth").addEventListener("click", () => changeRecordingMonth(1));
+  $("recordingCalendarGrid").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-recording-date]");
+    if (button && !button.disabled) selectRecordingDate(button.dataset.recordingDate);
+  });
+  $("recordingCameras").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-recording-camera]");
+    if (button) selectRecordingCamera(button.dataset.recordingCamera);
+  });
   $("clearViewLog").addEventListener("click", () => $("logBox").textContent = "");
   $("startSelected").addEventListener("click", () => start(selectedIds()));
   $("startAll").addEventListener("click", () => start([], true));
